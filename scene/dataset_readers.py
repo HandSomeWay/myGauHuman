@@ -41,6 +41,7 @@ class CameraInfo(NamedTuple):
     FovY: np.array
     FovX: np.array
     image: np.array
+    normal: np.array
     image_path: str
     image_name: str
     bkgd_mask: np.array
@@ -616,6 +617,10 @@ def readCamerasZJUMoCapRefine(path, output_view, white_background, image_scaling
             msk = imageio.imread(msk_path)
             msk = (msk != 0).astype(np.uint8)
 
+            # Load normal
+            normal_path = image_path.replace('images', 'normal')
+            normal = np.array(imageio.imread(normal_path).astype(np.float32)/255.)
+
             if not novel_view_vis:
                 cam_ind = cam_inds[pose_index][view_index]
                 K = np.array(cams['K'][cam_ind])
@@ -625,6 +630,7 @@ def readCamerasZJUMoCapRefine(path, output_view, white_background, image_scaling
 
                 image = cv2.undistort(image, K, D)
                 msk = cv2.undistort(msk, K, D)
+                normal = cv2.undistort(normal, K, D)
             else:
                 pose = np.matmul(np.array([[1,0,0,0], [0,-1,0,0], [0,0,-1,0], [0,0,0,1]]), get_camera_extrinsics_zju_mocap_refine(view_index_look_at, val=True))
                 R = pose[:3,:3]
@@ -633,6 +639,7 @@ def readCamerasZJUMoCapRefine(path, output_view, white_background, image_scaling
                 K = np.array(cams['K'][cam_ind])
 
             image[msk == 0] = 1 if white_background else 0
+            normal[msk == 0] = 1 if white_background else 0
 
             # change from OpenGL/Blender camera axes (Y up, Z back) to COLMAP (Y down, Z forward)
             w2c = np.eye(4)
@@ -649,9 +656,11 @@ def readCamerasZJUMoCapRefine(path, output_view, white_background, image_scaling
                 H, W = int(image.shape[0] * ratio), int(image.shape[1] * ratio)
                 image = cv2.resize(image, (W, H), interpolation=cv2.INTER_AREA)
                 msk = cv2.resize(msk, (W, H), interpolation=cv2.INTER_NEAREST)
+                normal = cv2.resize(normal, (W, H), interpolation=cv2.INTER_AREA)
                 K[:2] = K[:2] * ratio
 
             image = Image.fromarray(np.array(image*255.0, dtype=np.byte), "RGB")
+            normal = Image.fromarray(np.array(normal*255.0, dtype=np.byte), "RGB")
 
             focalX = K[0,0]
             focalY = K[1,1]
@@ -685,7 +694,7 @@ def readCamerasZJUMoCapRefine(path, output_view, white_background, image_scaling
             bkgd_mask = Image.fromarray(np.array(msk*255.0, dtype=np.byte))
 
             cam_infos.append(CameraInfo(uid=idx, pose_id=pose_index, R=R, T=T, K=K, FovY=FovY, FovX=FovX, image=image,
-                            image_path=image_path, image_name=image_name, bkgd_mask=bkgd_mask, 
+                            image_path=image_path, image_name=image_name, bkgd_mask=bkgd_mask, normal=normal,
                             bound_mask=bound_mask, width=image.size[0], height=image.size[1], 
                             smpl_param=smpl_param, world_vertex=xyz, world_bound=world_bound, 
                             big_pose_smpl_param=big_pose_smpl_param, big_pose_world_vertex=big_pose_xyz, 

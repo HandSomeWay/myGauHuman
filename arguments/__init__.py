@@ -85,6 +85,7 @@ class OptimizationParams(ParamGroup):
         self.rotation_lr = 0.001
         self.pose_refine_lr = 0.00005
         self.lbs_offset_lr = 0.00005
+        self.normal_lr = 0.0002
         self.percent_dense = 0.01
         self.lambda_dssim = 0.2
         self.densification_interval = 100

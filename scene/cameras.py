@@ -16,7 +16,7 @@ from utils.graphics_utils import getWorld2View2, getProjectionMatrix, getProject
 
 class Camera(nn.Module):
     def __init__(self, colmap_id, pose_id, R, T, K, FoVx, FoVy, image, gt_alpha_mask,
-                 image_name, uid,
+                 image_name, uid, normal,
                  bkgd_mask=None, bound_mask=None, smpl_param=None, 
                  world_vertex=None, world_bound=None, big_pose_smpl_param=None,
                  big_pose_world_vertex=None, big_pose_world_bound=None,
@@ -47,11 +47,15 @@ class Camera(nn.Module):
         self.image_width = self.original_image.shape[2]
         self.image_height = self.original_image.shape[1]
 
+        self.original_normal = normal.clamp(0.0, 1.0)
+
         if gt_alpha_mask is not None:
             self.original_image *= gt_alpha_mask#.to(self.data_device)
+            self.original_normal *= gt_alpha_mask
         else:
             self.original_image *= torch.ones((1, self.image_height, self.image_width)) #torch.ones((1, self.image_height, self.image_width), device=self.data_device)
-
+            self.original_normal *= torch.ones((1, self.image_height, self.image_width))
+            
         self.zfar = 1000 #100.0
         self.znear = 0.001 #0.01
 

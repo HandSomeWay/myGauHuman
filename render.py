@@ -31,9 +31,13 @@ loss_fn_vgg = lpips.LPIPS(net='vgg').to(torch.device('cuda', torch.cuda.current_
 def render_set(model_path, name, iteration, views, gaussians, pipeline, background):
     render_path = os.path.join(model_path, name, "ours_{}".format(iteration), "renders")
     gts_path = os.path.join(model_path, name, "ours_{}".format(iteration), "gt")
+    normal_path = os.path.join(model_path, name, "ours_{}".format(iteration), "normal")
+    # render_normal_path = os.path.join(model_path, name, "ours_{}".format(iteration), "render_normal")
 
     makedirs(render_path, exist_ok=True)
     makedirs(gts_path, exist_ok=True)
+    makedirs(normal_path, exist_ok=True)
+    # makedirs(render_normal_path, exist_ok=True)
 
     # Load data (deserialize)
     with open(model_path + '/smpl_rot/' + f'iteration_{iteration}/' + 'smpl_rot.pickle', 'rb') as handle:
@@ -41,10 +45,15 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
 
     rgbs = []
     rgbs_gt = []
+    rgbs_normal = []
+    # rgbs_normal_rd = []
     elapsed_time = 0
 
     for _, view in enumerate(tqdm(views, desc="Rendering progress")):
         gt = view.original_image[0:3, :, :].cuda()
+
+        normal = view.original_normal[0:3, :, :].cuda()
+
         bound_mask = view.bound_mask
         transforms, translation = smpl_rot[name][view.pose_id]['transforms'], smpl_rot[name][view.pose_id]['translation']
 
@@ -52,6 +61,7 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
         start_time = time.time() 
         render_output = render(view, gaussians, pipeline, background, transforms=transforms, translation=translation)
         rendering = render_output["render"]
+        # render_normal = render_output["normal"]
         
         # end time
         end_time = time.time()
@@ -59,9 +69,12 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
         elapsed_time += end_time - start_time
 
         rendering.permute(1,2,0)[bound_mask[0]==0] = 0 if background.sum().item() == 0 else 1
+        # render_normal.permute(1,2,0)[bound_mask[0]==0] = 0 if background.sum().item() == 0 else 1
 
         rgbs.append(rendering)
         rgbs_gt.append(gt)
+        rgbs_normal.append(normal)
+        # rgbs_normal_rd.append(render_normal)
 
     # Calculate elapsed time
     print("Elapsed time: ", elapsed_time, " FPS: ", len(views)/elapsed_time) 
@@ -73,10 +86,17 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
     for id in range(len(views)):
         rendering = rgbs[id]
         gt = rgbs_gt[id]
+        normal = rgbs_normal[id]
+        # render_normal = rgbs_normal_rd[id]
+
         rendering = torch.clamp(rendering, 0.0, 1.0)
         gt = torch.clamp(gt, 0.0, 1.0)
+        normal = torch.clamp(normal, 0.0, 1.0)
+        # render_normal = torch.clamp(render_normal, 0.0, 1.0)
         torchvision.utils.save_image(rendering, os.path.join(render_path, '{0:05d}'.format(id) + ".png"))
         torchvision.utils.save_image(gt, os.path.join(gts_path, '{0:05d}'.format(id) + ".png"))
+        torchvision.utils.save_image(normal, os.path.join(normal_path, '{0:05d}'.format(id) + ".png"))
+        # torchvision.utils.save_image(render_normal, os.path.join(render_normal_path, '{0:05d}'.format(id) + ".png"))
 
         # metrics
         psnrs += psnr(rendering, gt).mean().double()
