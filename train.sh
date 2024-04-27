@@ -1,0 +1,3 @@
+# python train.py -s ~/data/zju_mocap_refine/my_386 --eval --exp_name zju_mocap_refine/my_386_shadowmap_test --motion_offset_flag --smpl_type smpl --actor_gender neutral --iterations 3000 
+# python train.py -s ~/data/zju_mocap_refine/my_392 --eval --exp_name zju_mocap_refine/my_392_shadowmap_test --motion_offset_flag --smpl_type smpl --actor_gender neutral --iterations 3000 
+python train.py -s ~/data/zju_mocap_refine/my_377 --eval --exp_name zju_mocap_refine/my_377 --motion_offset_flag --smpl_type smpl --actor_gender neutral --iterations 3000 
