@@ -164,16 +164,15 @@ class GaussianModel:
     def get_normal(self, dir_pp_normalized=None):
         normal_axis = self.get_minimum_axis
         normal_axis = normal_axis
-        # normal_axis, positive = flip_align_view(normal_axis, dir_pp_normalized)
-        # delta_normal1 = self._normal  # (N, 3) 
-        # delta_normal2 = self._normal2 # (N, 3) 
-        # delta_normal = torch.stack([delta_normal1, delta_normal2], dim=-1) # (N, 3, 2)
-        # idx = torch.where(positive, 0, 1).long()[:,None,:].repeat(1, 3, 1) # (N, 3, 1)
-        # delta_normal = torch.gather(delta_normal, index=idx, dim=-1).squeeze(-1) # (N, 3)
-        # normal = delta_normal + normal_axis 
-        # normal = normal/normal.norm(dim=1, keepdim=True) # (N, 3)
-        return normal_axis + self._normal
-
+        normal_axis, positive = flip_align_view(normal_axis, dir_pp_normalized)
+        delta_normal1 = self._normal  # (N, 3) 
+        delta_normal2 = self._normal2 # (N, 3) 
+        delta_normal = torch.stack([delta_normal1, delta_normal2], dim=-1) # (N, 3, 2)
+        idx = torch.where(positive, 0, 1).long()[:,None,:].repeat(1, 3, 1) # (N, 3, 1)
+        delta_normal = torch.gather(delta_normal, index=idx, dim=-1).squeeze(-1) # (N, 3)
+        normal = delta_normal + normal_axis 
+        normal = normal/normal.norm(dim=1, keepdim=True) # (N, 3)
+        return normal
 
     @property
     def get_minimum_axis(self):
