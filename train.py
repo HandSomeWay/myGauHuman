@@ -9,10 +9,11 @@
 # For inquiries contact  george.drettakis@inria.fr
 #
 
+
 import os
 import torch
 from random import randint
-from utils.loss_utils import l1_loss, l2_loss, ssim
+from utils.loss_utils import l1_loss, l2_loss, ssim, predicted_normal_loss
 from gaussian_renderer import render, network_gui
 import sys
 from scene import Scene, GaussianModel
@@ -60,6 +61,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     mask_loss_for_log = 0.0
     ssim_loss_for_log = 0.0
     lpips_loss_for_log = 0.0
+    normal_loss_for_log = 0.0
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
 
@@ -103,13 +105,18 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             pipe.debug = True
         render_pkg = render(viewpoint_cam, gaussians, pipe, background)
         image, alpha, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["render_alpha"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
+        normal = render_pkg["normal"]
 
         # Loss
+        gt_normal = viewpoint_cam.original_normal.cuda()
         gt_image = viewpoint_cam.original_image.cuda()
         bkgd_mask = viewpoint_cam.bkgd_mask.cuda()
         bound_mask = viewpoint_cam.bound_mask.cuda()
         Ll1 = l1_loss(image.permute(1,2,0)[bound_mask[0]==1], gt_image.permute(1,2,0)[bound_mask[0]==1])
         mask_loss = l2_loss(alpha[bound_mask==1], bkgd_mask[bound_mask==1])
+
+        # normal_loss = l1_loss(normal.permute(1,2,0)[bound_mask[0]==1], gt_normal.permute(1,2,0)[bound_mask[0]==1])
+        normal_loss = predicted_normal_loss(normal=normal, normal_ref=gt_normal, alpha=bound_mask)
 
         # crop the object region
         x, y, w, h = cv2.boundingRect(bound_mask[0].cpu().numpy().astype(np.uint8))
@@ -120,7 +127,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         # lipis loss
         lpips_loss = loss_fn_vgg(img_pred, img_gt).reshape(-1)
 
-        loss = Ll1 + 0.1 * mask_loss + 0.01 * (1.0 - ssim_loss) + 0.01 * lpips_loss
+        loss = Ll1 + 0.1 * mask_loss + 0.01 * (1.0 - ssim_loss) + 0.01 * lpips_loss + 0.1 * normal_loss
         loss.backward()
 
         # end time
@@ -140,9 +147,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             mask_loss_for_log = 0.4 * mask_loss.item() + 0.6 * mask_loss_for_log
             ssim_loss_for_log = 0.4 * ssim_loss.item() + 0.6 * ssim_loss_for_log
             lpips_loss_for_log = 0.4 * lpips_loss.item() + 0.6 * lpips_loss_for_log
+            normal_loss_for_log = 0.4 * normal_loss.item() + 0.6 * normal_loss_for_log
             if iteration % 10 == 0:
                 progress_bar.set_postfix({"#pts": gaussians._xyz.shape[0], "Ll1 Loss": f"{Ll1_loss_for_log:.{3}f}", "mask Loss": f"{mask_loss_for_log:.{2}f}",
-                                          "ssim": f"{ssim_loss_for_log:.{2}f}", "lpips": f"{lpips_loss_for_log:.{2}f}"})
+                                          "ssim": f"{ssim_loss_for_log:.{2}f}", "lpips": f"{lpips_loss_for_log:.{2}f}", "normal":f"{normal_loss_for_log:.{2}f}"})
                 progress_bar.update(10)
             if iteration == opt.iterations:
                 progress_bar.close()
@@ -284,7 +292,7 @@ if __name__ == "__main__":
     parser.add_argument('--debug_from', type=int, default=-1)
     parser.add_argument('--detect_anomaly', action='store_true', default=False)
     parser.add_argument("--test_iterations", nargs="+", type=int, default=[1_200, 2_000, 3_000, 7_000, 30_000])
-    parser.add_argument("--save_iterations", nargs="+", type=int, default=[1_200, 2_000, 3_000, 7_000, 30_000])
+    parser.add_argument("--save_iterations", nargs="+", type=int, default= [1_200, 2_000, 3_000, 7_000, 30_000])
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
     parser.add_argument("--start_checkpoint", type=str, default = None)

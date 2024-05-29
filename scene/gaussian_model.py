@@ -161,16 +161,17 @@ class GaussianModel:
     #                                               normal
     ############################################################################################################################
     
-    def get_normal(self, dir_pp_normalized=None):
+    def get_normal(self, dir_pp_normalized=None, transforms=None):
         normal_axis = self.get_minimum_axis
-        normal_axis = normal_axis
-        normal_axis, positive = flip_align_view(normal_axis, dir_pp_normalized)
-        delta_normal1 = self._normal  # (N, 3) 
-        delta_normal2 = self._normal2 # (N, 3) 
-        delta_normal = torch.stack([delta_normal1, delta_normal2], dim=-1) # (N, 3, 2)
-        idx = torch.where(positive, 0, 1).long()[:,None,:].repeat(1, 3, 1) # (N, 3, 1)
-        delta_normal = torch.gather(delta_normal, index=idx, dim=-1).squeeze(-1) # (N, 3)
-        normal = delta_normal + normal_axis 
+        # normal_axis = torch.matmul(transforms, normal_axis[..., None]).squeeze(-1).squeeze()
+        # normal_axis, positive = flip_align_view(normal_axis, dir_pp_normalized)
+        # delta_normal1 = self._normal  # (N, 3) 
+        # delta_normal2 = self._normal2 # (N, 3) 
+        # delta_normal = torch.stack([delta_normal1, delta_normal2], dim=-1) # (N, 3, 2)
+        # idx = torch.where(positive, 0, 1).long()[:,None,:].repeat(1, 3, 1) # (N, 3, 1)
+        # delta_normal = torch.gather(delta_normal, index=idx, dim=-1).squeeze(-1) # (N, 3)
+        # normal = delta_normal + normal_axis 
+        normal = normal_axis + self._normal
         normal = normal/normal.norm(dim=1, keepdim=True) # (N, 3)
         return normal
 
@@ -712,7 +713,7 @@ class GaussianModel:
         self.xyz_gradient_accum[update_filter] += torch.norm(viewspace_point_tensor.grad[update_filter,:2], dim=-1, keepdim=True)
         self.denom[update_filter] += 1
 
-    def coarse_deform_c2source(self, query_pts, params, t_params, t_vertices, lbs_weights=None, correct_Rs=None, return_transl=False):
+    def coarse_deform_c2source(self, query_pts, params, t_params, t_vertices, lbs_weights=None, correct_Rs=None, return_transl=False, normals=None):
         bs = query_pts.shape[0]
         joints_num = self.SMPL_NEUTRAL['weights'].shape[-1]
         vertices_num = t_vertices.shape[1]
@@ -735,6 +736,7 @@ class GaussianModel:
         query_pts = query_pts - A[..., :3, 3]
         R_inv = torch.inverse(A[..., :3, :3].float())
         query_pts = torch.matmul(R_inv, query_pts[..., None]).squeeze(-1)
+        normals = torch.matmul(R_inv, normals[..., None]).squeeze(-1)
 
         # transforms from Big To T Pose
         transforms = R_inv
@@ -796,6 +798,8 @@ class GaussianModel:
         A = torch.matmul(bweights, self.s_A.reshape(bs, joints_num, -1))
         A = torch.reshape(A, (bs, -1, 4, 4))
         can_pts = torch.matmul(A[..., :3, :3], query_pts[..., None]).squeeze(-1)
+        smpl_normals = torch.matmul(A[..., :3, :3], normals[..., None]).squeeze(-1)
+
         smpl_src_pts = can_pts + A[..., :3, 3]
         
         transforms = torch.matmul(A[..., :3, :3], transforms)
@@ -806,13 +810,14 @@ class GaussianModel:
         # transform points from the smpl space to the world space
         R_inv = torch.inverse(R)
         world_src_pts = torch.matmul(smpl_src_pts, R_inv) + Th
+        world_normals = torch.matmul(smpl_normals, R_inv)
         
         transforms = torch.matmul(R, transforms)
 
         if return_transl: 
             translation = torch.matmul(translation, R_inv).squeeze(-1) + Th
 
-        return smpl_src_pts, world_src_pts, bweights, transforms, translation
+        return smpl_src_pts, world_src_pts, bweights, transforms, translation, world_normals
 
 def read_pickle(pkl_path):
     with open(pkl_path, 'rb') as f:

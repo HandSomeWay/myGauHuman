@@ -68,8 +68,8 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
         # Calculate elapsed time
         elapsed_time += end_time - start_time
 
-        rendering.permute(1,2,0)[bound_mask[0]==0] = 0 if background.sum().item() == 0 else 1
-        render_normal.permute(1,2,0)[bound_mask[0]==0] = 0 if background.sum().item() == 0 else 1
+        # rendering.permute(1,2,0)[bound_mask[0]==0] = 0 if background.sum().item() == 0 else 1
+        # render_normal.permute(1,2,0)[bound_mask[0]==0] = 0 if background.sum().item() == 0 else 1
 
         rgbs.append(rendering)
         rgbs_gt.append(gt)
@@ -87,28 +87,28 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
         rendering = rgbs[id]
         gt = rgbs_gt[id]
         normal = rgbs_normal[id]
-        # render_normal = rgbs_normal_rd[id]
+        render_normal = rgbs_normal_rd[id]
 
         rendering = torch.clamp(rendering, 0.0, 1.0)
         gt = torch.clamp(gt, 0.0, 1.0)
         normal = torch.clamp(normal, 0.0, 1.0)
-        # render_normal = torch.clamp(render_normal, 0.0, 1.0)
+        render_normal = torch.clamp(render_normal, 0.0, 1.0)
         torchvision.utils.save_image(rendering, os.path.join(render_path, '{0:05d}'.format(id) + ".png"))
         torchvision.utils.save_image(gt, os.path.join(gts_path, '{0:05d}'.format(id) + ".png"))
         torchvision.utils.save_image(normal, os.path.join(normal_path, '{0:05d}'.format(id) + ".png"))
-        # torchvision.utils.save_image(render_normal, os.path.join(render_normal_path, '{0:05d}'.format(id) + ".png"))
+        torchvision.utils.save_image(render_normal, os.path.join(render_normal_path, '{0:05d}'.format(id) + ".png"))
 
-        # metrics
-        psnrs += psnr(rendering, gt).mean().double()
-        ssims += ssim(rendering, gt).mean().double()
-        lpipss += loss_fn_vgg(rendering, gt).mean().double()
+    #     # metrics
+    #     psnrs += psnr(rendering, gt).mean().double()
+    #     ssims += ssim(rendering, gt).mean().double()
+    #     lpipss += loss_fn_vgg(rendering, gt).mean().double()
 
-    psnrs /= len(views)   
-    ssims /= len(views)
-    lpipss /= len(views)  
+    # psnrs /= len(views)   
+    # ssims /= len(views)
+    # lpipss /= len(views)  
 
-    # evalution metrics
-    print("\n[ITER {}] Evaluating {} #{}: PSNR {} SSIM {} LPIPS {}".format(iteration, name, len(views), psnrs, ssims, lpipss))
+    # # evalution metrics
+    # print("\n[ITER {}] Evaluating {} #{}: PSNR {} SSIM {} LPIPS {}".format(iteration, name, len(views), psnrs, ssims, lpipss))
 
 def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParams, skip_train : bool, skip_test : bool):
     with torch.no_grad():

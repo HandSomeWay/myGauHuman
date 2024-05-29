@@ -35,8 +35,8 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     tanfovy = math.tan(viewpoint_camera.FoVy * 0.5)
 
     raster_settings = GaussianRasterizationSettings(
-        image_height=int(viewpoint_camera.image_height),
-        image_width=int(viewpoint_camera.image_width),
+        image_height=1, #int(viewpoint_camera.image_height),
+        image_width=1, #int(viewpoint_camera.image_width),
         tanfovx=tanfovx,
         tanfovy=tanfovy,
         bg=bg_color,
@@ -51,11 +51,11 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
 
     rasterizer = GaussianRasterizer(raster_settings=raster_settings)
     means3D = pc.get_xyz
-
+    normal = pc.get_normal()
     if not pc.motion_offset_flag:
-        _, means3D, _, transforms, _ = pc.coarse_deform_c2source(means3D[None], viewpoint_camera.smpl_param,
+        _, means3D, _, transforms, _, world_normal = pc.coarse_deform_c2source(means3D[None], viewpoint_camera.smpl_param,
             viewpoint_camera.big_pose_smpl_param,
-            viewpoint_camera.big_pose_world_vertex[None])
+            viewpoint_camera.big_pose_world_vertex[None], normals=normal[None])
     else:
         if transforms is None:
             # pose offset
@@ -68,20 +68,28 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
             lbs_weights = lbs_weights.permute(0,2,1)
 
             # transform points
-            _, means3D, _, transforms, translation = pc.coarse_deform_c2source(means3D[None], viewpoint_camera.smpl_param,
+            _, means3D, _, transforms, translation, world_normal = pc.coarse_deform_c2source(means3D[None], viewpoint_camera.smpl_param,
                 viewpoint_camera.big_pose_smpl_param,
-                viewpoint_camera.big_pose_world_vertex[None], lbs_weights=lbs_weights, correct_Rs=correct_Rs, return_transl=return_smpl_rot)
+                viewpoint_camera.big_pose_world_vertex[None], lbs_weights=lbs_weights, correct_Rs=correct_Rs, return_transl=return_smpl_rot, normals=normal[None])
         else:
             correct_Rs = None
             means3D = torch.matmul(transforms, means3D[..., None]).squeeze(-1) + translation
-
+            world_normal = torch.matmul(transforms, normal[..., None]).squeeze(-1)
 
     means3D = means3D.squeeze()
     means2D = screenspace_points
     opacity = pc.get_opacity
 
     viewmatrix = viewpoint_camera.world_view_transform
-    
+
+    world_normal = world_normal.squeeze()
+    # normal = world_normal
+
+
+    # normal = pc.get_normal(dir_pp_normalized, transforms)  
+    normal = transformVector3x3(world_normal, viewmatrix)
+    normal = (normal * 0.5) + 0.5
+    normal = normal[:, [2, 0, 1]]
 
     # If precomputed 3d covariance is provided, use it. If not, then it will be computed from
     # scaling / rotation by the rasterizer.
@@ -107,10 +115,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
             sh2rgb = eval_sh(pc.active_sh_degree, shs_view, dir_pp_normalized)
             colors_precomp = torch.clamp_min(sh2rgb + 0.5, 0.0)
             
-            normal = pc.get_normal(dir_pp_normalized)  
-            normal = transformVector3x3(normal, viewmatrix)
-            normal = (normal * 0.5) + 0.5
-            normal = normal[:, [2, 0, 1]]
+
         else:
             shs = pc.get_features
     else:
