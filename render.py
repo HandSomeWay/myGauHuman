@@ -111,6 +111,7 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
     print("\n[ITER {}] Evaluating {} #{}: PSNR {} SSIM {} LPIPS {}".format(iteration, name, len(views), psnrs, ssims, lpipss))
 
 def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParams, skip_train : bool, skip_test : bool):
+    print(dataset)
     with torch.no_grad():
         gaussians = GaussianModel(dataset.sh_degree, dataset.smpl_type, dataset.motion_offset_flag, dataset.actor_gender)
         scene = Scene(dataset, gaussians, load_iteration=iteration, shuffle=False)
