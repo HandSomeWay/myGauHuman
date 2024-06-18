@@ -67,7 +67,7 @@ class GaussianModel:
         self.setup_functions()
         
         self._normal = torch.empty(0)
-        self._normal2 = torch.empty(0)
+        self._albedo = torch.empty(0)
 
         self.device=torch.device('cuda', torch.cuda.current_device())
         # load SMPL model
@@ -111,7 +111,7 @@ class GaussianModel:
             self.pose_decoder,
             self.lweight_offset_decoder,
             self._normal,
-            self._normal2,
+            self._albedo,
         )
     
     def restore(self, model_args, training_args):
@@ -130,7 +130,7 @@ class GaussianModel:
         self.pose_decoder,
         self.lweight_offset_decoder,
         self._normal,
-        self._normal2,) = model_args
+        self._albedo,) = model_args
         self.training_setup(training_args)
         self.xyz_gradient_accum = xyz_gradient_accum
         self.denom = denom
@@ -161,16 +161,8 @@ class GaussianModel:
     #                                               normal
     ############################################################################################################################
     
-    def get_normal(self, dir_pp_normalized=None, transforms=None):
+    def get_normal(self):
         normal_axis = self.get_minimum_axis
-        # normal_axis = torch.matmul(transforms, normal_axis[..., None]).squeeze(-1).squeeze()
-        # normal_axis, positive = flip_align_view(normal_axis, dir_pp_normalized)
-        # delta_normal1 = self._normal  # (N, 3) 
-        # delta_normal2 = self._normal2 # (N, 3) 
-        # delta_normal = torch.stack([delta_normal1, delta_normal2], dim=-1) # (N, 3, 2)
-        # idx = torch.where(positive, 0, 1).long()[:,None,:].repeat(1, 3, 1) # (N, 3, 1)
-        # delta_normal = torch.gather(delta_normal, index=idx, dim=-1).squeeze(-1) # (N, 3)
-        # normal = delta_normal + normal_axis 
         normal = normal_axis + self._normal
         normal = normal/normal.norm(dim=1, keepdim=True) # (N, 3)
         return normal
@@ -215,9 +207,9 @@ class GaussianModel:
 
 
         normals = np.zeros_like(np.asarray(pcd.points, dtype=np.float32))
-        normals2 = np.copy(normals)
+        albedo = np.copy(normals)
         self._normal = nn.Parameter(torch.from_numpy(normals).to(self._xyz.device).requires_grad_(True))
-        self._normal2 = nn.Parameter(torch.from_numpy(normals2).to(self._xyz.device).requires_grad_(True))
+        self._albedo = nn.Parameter(torch.from_numpy(albedo).to(self._xyz.device).requires_grad_(True))
     def training_setup(self, training_args):
         self.percent_dense = training_args.percent_dense
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
@@ -233,7 +225,7 @@ class GaussianModel:
                 {'params': [self._rotation], 'lr': training_args.rotation_lr, "name": "rotation"}
             ]
         else:
-            self._normal.requires_grad_(requires_grad=False)
+            self._normal.requires_grad_(requires_grad=True)
             l = [
                 {'params': [self._xyz], 'lr': training_args.position_lr_init * self.spatial_lr_scale, "name": "xyz"},
                 {'params': [self._features_dc], 'lr': training_args.feature_lr, "name": "f_dc"},
@@ -247,9 +239,9 @@ class GaussianModel:
             l.extend([
                 {'params': [self._normal], 'lr': training_args.normal_lr, "name": "normal"},
             ])
-            self._normal2.requires_grad_(requires_grad=False)
+            self._albedo.requires_grad_(requires_grad=True)
             l.extend([
-                {'params': [self._normal2], 'lr': training_args.normal_lr, "name": "normal2"},
+                {'params': [self._albedo], 'lr': training_args.opacity_lr, "name": "albedo"},
             ])
 
         self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
@@ -289,7 +281,7 @@ class GaussianModel:
 
         xyz = self._xyz.detach().cpu().numpy()
         normals = self._normal.detach().cpu().numpy()
-        normals2 = self._normal2.detach().cpu().numpy()
+        albedo = self._albedo.detach().cpu().numpy()
         f_dc = self._features_dc.detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy()
         f_rest = self._features_rest.detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy()
         opacities = self._opacity.detach().cpu().numpy()
@@ -299,7 +291,7 @@ class GaussianModel:
         dtype_full = [(attribute, 'f4') for attribute in self.construct_list_of_attributes()]
 
         elements = np.empty(xyz.shape[0], dtype=dtype_full)
-        attributes = np.concatenate((xyz, normals, normals2,  f_dc, f_rest, opacities, scale, rotation), axis=1)
+        attributes = np.concatenate((xyz, normals, albedo,  f_dc, f_rest, opacities, scale, rotation), axis=1)
         elements[:] = list(map(tuple, attributes))
         el = PlyElement.describe(elements, 'vertex')
         PlyData([el]).write(path)
@@ -347,7 +339,7 @@ class GaussianModel:
                             np.asarray(plydata.elements[0]["ny"]),
                             np.asarray(plydata.elements[0]["nz"])),  axis=1)
         
-        normal2 = np.stack((np.asarray(plydata.elements[0]["nx2"]),
+        albedo = np.stack((np.asarray(plydata.elements[0]["nx2"]),
                             np.asarray(plydata.elements[0]["ny2"]),
                             np.asarray(plydata.elements[0]["nz2"])),  axis=1)
 
@@ -360,7 +352,7 @@ class GaussianModel:
         self._rotation = nn.Parameter(torch.tensor(rots, dtype=torch.float, device="cuda").requires_grad_(True))
 
         self._normal = nn.Parameter(torch.tensor(normal, dtype=torch.float, device="cuda").requires_grad_(True))
-        self._normal2 = nn.Parameter(torch.tensor(normal2, dtype=torch.float, device="cuda").requires_grad_(True))
+        self._albedo = nn.Parameter(torch.tensor(albedo, dtype=torch.float, device="cuda").requires_grad_(True))
 
         self.active_sh_degree = self.max_sh_degree
 
@@ -383,7 +375,7 @@ class GaussianModel:
         optimizable_tensors = {}
         for group in self.optimizer.param_groups:
             # if len(group["params"]) == 1:
-            if group["name"] in ['xyz', 'f_dc', 'f_rest', 'opacity', 'scaling', 'rotation', 'normal', 'normal2']:
+            if group["name"] in ['xyz', 'f_dc', 'f_rest', 'opacity', 'scaling', 'rotation', 'normal', 'albedo']:
                 stored_state = self.optimizer.state.get(group['params'][0], None)
                 if stored_state is not None:
                     stored_state["exp_avg"] = stored_state["exp_avg"][mask]
@@ -411,7 +403,7 @@ class GaussianModel:
         self._rotation = optimizable_tensors["rotation"]
 
         self._normal = optimizable_tensors["normal"]
-        self._normal2 = optimizable_tensors["normal2"]
+        self._albedo = optimizable_tensors["albedo"]
 
         self.xyz_gradient_accum = self.xyz_gradient_accum[valid_points_mask]
 
@@ -422,7 +414,7 @@ class GaussianModel:
         optimizable_tensors = {}
         for group in self.optimizer.param_groups:
             # assert len(group["params"]) == 1
-            if group["name"] in ['xyz', 'f_dc', 'f_rest', 'opacity', 'scaling', 'rotation', 'normal', 'normal2']:
+            if group["name"] in ['xyz', 'f_dc', 'f_rest', 'opacity', 'scaling', 'rotation', 'normal', 'albedo']:
                 extension_tensor = tensors_dict[group["name"]]
                 stored_state = self.optimizer.state.get(group['params'][0], None)
                 if stored_state is not None:
@@ -441,7 +433,7 @@ class GaussianModel:
 
         return optimizable_tensors
 
-    def densification_postfix(self, new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_normal, new_normal2):
+    def densification_postfix(self, new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_normal, new_albedo):
         d = {"xyz": new_xyz,
         "f_dc": new_features_dc,
         "f_rest": new_features_rest,
@@ -450,7 +442,7 @@ class GaussianModel:
         "rotation" : new_rotation}
         d.update({
                 "normal" : new_normal,
-                "normal2" : new_normal2,
+                "albedo" : new_albedo,
             })
 
         optimizable_tensors = self.cat_tensors_to_optimizer(d)
@@ -462,7 +454,7 @@ class GaussianModel:
         self._rotation = optimizable_tensors["rotation"]
         
         self._normal = optimizable_tensors["normal"]
-        self._normal2 = optimizable_tensors["normal2"]
+        self._albedo = optimizable_tensors["albedo"]
 
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
@@ -489,9 +481,9 @@ class GaussianModel:
         new_opacity = self._opacity[selected_pts_mask].repeat(N,1)
         
         new_normal = self._normal[selected_pts_mask].repeat(N,1) 
-        new_normal2 = self._normal2[selected_pts_mask].repeat(N,1)
+        new_albedo = self._albedo[selected_pts_mask].repeat(N,1)
 
-        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation, new_normal, new_normal2)
+        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation, new_normal, new_albedo)
 
         prune_filter = torch.cat((selected_pts_mask, torch.zeros(N * selected_pts_mask.sum(), device="cuda", dtype=bool)))
         self.prune_points(prune_filter)
@@ -509,10 +501,10 @@ class GaussianModel:
         new_rotation = self._rotation[selected_pts_mask]
         
         new_normal = self._normal[selected_pts_mask]
-        new_normal2 = self._normal2[selected_pts_mask]
+        new_albedo = self._albedo[selected_pts_mask]
 
 
-        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_normal, new_normal2)
+        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_normal, new_albedo)
 
     def kl_densify_and_clone(self, grads, grad_threshold, scene_extent, kl_threshold=0.4):
         # Extract points that satisfy the gradient condition
@@ -553,9 +545,9 @@ class GaussianModel:
         new_opacity = self._opacity[selected_pts_mask]
         
         new_normal = self._normal[selected_pts_mask]
-        new_normal2 = self._normal2[selected_pts_mask]
+        new_albedo = self._albedo[selected_pts_mask]
 
-        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation,  new_normal, new_normal2)
+        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation,  new_normal, new_albedo)
 
     def kl_densify_and_split(self, grads, grad_threshold, scene_extent, kl_threshold=0.4, N=2):
         n_init_points = self.get_xyz.shape[0]
@@ -599,9 +591,9 @@ class GaussianModel:
         new_opacity = self._opacity[selected_pts_mask].repeat(N,1)
         
         new_normal = self._normal[selected_pts_mask].repeat(N,1) 
-        new_normal2 = self._normal2[selected_pts_mask].repeat(N,1) 
+        new_albedo = self._albedo[selected_pts_mask].repeat(N,1) 
 
-        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation, new_normal, new_normal2)
+        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation, new_normal, new_albedo)
 
         prune_filter = torch.cat((selected_pts_mask, torch.zeros(N * selected_pts_mask.sum(), device="cuda", dtype=bool)))
         self.prune_points(prune_filter)
@@ -646,9 +638,9 @@ class GaussianModel:
             new_features_rest = self._features_rest[selected_point_ids].mean(1)
             new_opacity = self._opacity[selected_point_ids].mean(1)
             new_normal = self._normal[selected_pts_mask].mean(1)
-            new_normal2 = self._normal2[selected_pts_mask].mean(1)
+            new_albedo = self._albedo[selected_pts_mask].mean(1)
 
-            self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation, new_normal, new_normal2)
+            self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation, new_normal, new_albedo)
 
             selected_pts_mask[selected_point_ids[:,1]] = True
             # prune_filter = torch.cat((selected_pts_mask, torch.zeros(selected_pts_mask.sum(), device="cuda", dtype=bool)))

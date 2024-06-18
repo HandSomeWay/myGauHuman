@@ -98,17 +98,17 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
         torchvision.utils.save_image(normal, os.path.join(normal_path, '{0:05d}'.format(id) + ".png"))
         torchvision.utils.save_image(render_normal, os.path.join(render_normal_path, '{0:05d}'.format(id) + ".png"))
 
-    #     # metrics
-    #     psnrs += psnr(rendering, gt).mean().double()
-    #     ssims += ssim(rendering, gt).mean().double()
-    #     lpipss += loss_fn_vgg(rendering, gt).mean().double()
+        # metrics
+        psnrs += psnr(rendering, gt).mean().double()
+        ssims += ssim(rendering, gt).mean().double()
+        lpipss += loss_fn_vgg(rendering, gt).mean().double()
 
-    # psnrs /= len(views)   
-    # ssims /= len(views)
-    # lpipss /= len(views)  
+    psnrs /= len(views)   
+    ssims /= len(views)
+    lpipss /= len(views)  
 
-    # # evalution metrics
-    # print("\n[ITER {}] Evaluating {} #{}: PSNR {} SSIM {} LPIPS {}".format(iteration, name, len(views), psnrs, ssims, lpipss))
+    # evalution metrics
+    print("\n[ITER {}] Evaluating {} #{}: PSNR {} SSIM {} LPIPS {}".format(iteration, name, len(views), psnrs, ssims, lpipss))
 
 def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParams, skip_train : bool, skip_test : bool):
     with torch.no_grad():
