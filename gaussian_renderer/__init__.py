@@ -79,6 +79,10 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     means3D = means3D.squeeze()
     means2D = screenspace_points
     opacity = pc.get_opacity
+    albedo = pc.get_albedo
+    roughness = pc.get_roughness
+    metallic = pc.get_metallic
+    assert albedo.shape[0] == roughness.shape[0] and albedo.shape[0] == metallic.shape[0]
 
     viewmatrix = viewpoint_camera.world_view_transform
 
@@ -142,6 +146,33 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         rotations = rotations,
         cov3D_precomp = cov3D_precomp)
     
+    rendered_albedo, *_ = rasterizer(
+        means3D = means3D,
+        means2D = means2D,
+        shs = shs,
+        colors_precomp = albedo,
+        opacities = opacity,
+        scales = scales,
+        rotations = rotations,
+        cov3D_precomp = cov3D_precomp)
+    rendered_roughness, *_ = rasterizer(
+        means3D = means3D,
+        means2D = means2D,
+        shs = shs,
+        colors_precomp = roughness.repeat(1, 3),
+        opacities = opacity,
+        scales = scales,
+        rotations = rotations,
+        cov3D_precomp = cov3D_precomp)
+    rendered_metallic, *_ = rasterizer(
+        means3D = means3D,
+        means2D = means2D,
+        shs = shs,
+        colors_precomp = metallic.repeat(1, 3),
+        opacities = opacity,
+        scales = scales,
+        rotations = rotations,
+        cov3D_precomp = cov3D_precomp)
     # Those Gaussians that were frustum culled or had a radius of 0 were not visible.
     # They will be excluded from value updates used in the splitting criteria.
     return {"render": rendered_image,
@@ -154,4 +185,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
             "translation": translation,
             "correct_Rs": correct_Rs,
             "normal": rendered_normal,
+            "albedo": rendered_albedo,
+            "roughness":rendered_roughness,
+            "metallic":rendered_metallic,
             }

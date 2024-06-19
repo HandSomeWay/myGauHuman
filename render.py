@@ -33,11 +33,17 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
     gts_path = os.path.join(model_path, name, "ours_{}".format(iteration), "gt")
     normal_path = os.path.join(model_path, name, "ours_{}".format(iteration), "normal")
     render_normal_path = os.path.join(model_path, name, "ours_{}".format(iteration), "render_normal")
+    render_albedo_path = os.path.join(model_path, name, "ours_{}".format(iteration), "render_albedo")
+    render_roughness_path = os.path.join(model_path, name, "ours_{}".format(iteration), "render_roughness")
+    render_metallic_path = os.path.join(model_path, name, "ours_{}".format(iteration), "render_metallic")
 
     makedirs(render_path, exist_ok=True)
     makedirs(gts_path, exist_ok=True)
     makedirs(normal_path, exist_ok=True)
     makedirs(render_normal_path, exist_ok=True)
+    makedirs(render_albedo_path, exist_ok=True)
+    makedirs(render_roughness_path, exist_ok=True)
+    makedirs(render_metallic_path, exist_ok=True)
 
     # Load data (deserialize)
     with open(model_path + '/smpl_rot/' + f'iteration_{iteration}/' + 'smpl_rot.pickle', 'rb') as handle:
@@ -47,6 +53,9 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
     rgbs_gt = []
     rgbs_normal = []
     rgbs_normal_rd = []
+    albedo_rd = []
+    roughness_rd = []
+    metallic_rd = []
     elapsed_time = 0
 
     for _, view in enumerate(tqdm(views, desc="Rendering progress")):
@@ -62,19 +71,25 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
         render_output = render(view, gaussians, pipeline, background, transforms=transforms, translation=translation)
         rendering = render_output["render"]
         render_normal = render_output["normal"]
+        render_albedo = render_output["albedo"]
+        render_roughness = render_output["roughness"]
+        render_metallic = render_output["metallic"]
         
         # end time
         end_time = time.time()
         # Calculate elapsed time
         elapsed_time += end_time - start_time
 
-        # rendering.permute(1,2,0)[bound_mask[0]==0] = 0 if background.sum().item() == 0 else 1
-        # render_normal.permute(1,2,0)[bound_mask[0]==0] = 0 if background.sum().item() == 0 else 1
+        rendering.permute(1,2,0)[bound_mask[0]==0] = 0 if background.sum().item() == 0 else 1
+        render_normal.permute(1,2,0)[bound_mask[0]==0] = 0 if background.sum().item() == 0 else 1
 
         rgbs.append(rendering)
         rgbs_gt.append(gt)
         rgbs_normal.append(normal)
         rgbs_normal_rd.append(render_normal)
+        albedo_rd.append(render_albedo)
+        roughness_rd.append(render_roughness)
+        metallic_rd.append(render_metallic)
 
     # Calculate elapsed time
     print("Elapsed time: ", elapsed_time, " FPS: ", len(views)/elapsed_time) 
@@ -88,15 +103,24 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
         gt = rgbs_gt[id]
         normal = rgbs_normal[id]
         render_normal = rgbs_normal_rd[id]
+        render_albedo = albedo_rd[id]
+        render_roughness = roughness_rd[id]
+        render_metallic = metallic_rd[id]
 
         rendering = torch.clamp(rendering, 0.0, 1.0)
         gt = torch.clamp(gt, 0.0, 1.0)
         normal = torch.clamp(normal, 0.0, 1.0)
         render_normal = torch.clamp(render_normal, 0.0, 1.0)
+        render_albedo = torch.clamp(render_albedo, 0.0, 1.0)
+        render_roughness = torch.clamp(render_roughness, 0.0, 1.0)
+        render_metallic = torch.clamp(render_metallic, 0.0, 1.0)
         torchvision.utils.save_image(rendering, os.path.join(render_path, '{0:05d}'.format(id) + ".png"))
         torchvision.utils.save_image(gt, os.path.join(gts_path, '{0:05d}'.format(id) + ".png"))
         torchvision.utils.save_image(normal, os.path.join(normal_path, '{0:05d}'.format(id) + ".png"))
         torchvision.utils.save_image(render_normal, os.path.join(render_normal_path, '{0:05d}'.format(id) + ".png"))
+        torchvision.utils.save_image(render_albedo, os.path.join(render_albedo_path, '{0:05d}'.format(id) + ".png"))
+        torchvision.utils.save_image(render_roughness, os.path.join(render_roughness_path, '{0:05d}'.format(id) + ".png"))
+        torchvision.utils.save_image(render_metallic, os.path.join(render_metallic_path, '{0:05d}'.format(id) + ".png"))
 
         # metrics
         psnrs += psnr(rendering, gt).mean().double()

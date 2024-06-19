@@ -177,6 +177,20 @@ class GaussianModel:
     def get_minimum_axis(self):
         return get_minimum_axis(self.get_scaling, self.get_rotation)
 
+    @property
+    
+    def get_albedo(self):
+        return self.opacity_activation(self._albedo)
+    
+    @property
+    def get_roughness(self):
+        return self.opacity_activation(self._roughness)
+
+    @property
+    def get_metallic(self):
+        return self.opacity_activation(self._metallic)
+
+
     ############################################################################################################################
     
     def get_covariance(self, scaling_modifier = 1, transform=None):

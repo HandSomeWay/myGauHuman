@@ -1,6 +1,6 @@
 import torch
 
-a = torch.randn(3, 5, 5)
-b = a[0, :, :].unsqueeze(0)
-print(a.shape)
-print(b.shape)
+a = torch.randn(5, 1)
+b = a.repeat(1, 3)
+print(a)
+print(b)
