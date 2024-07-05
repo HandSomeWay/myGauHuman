@@ -276,14 +276,25 @@ class GaussianModel:
                                                     lr_delay_mult=training_args.position_lr_delay_mult,
                                                     max_steps=training_args.position_lr_max_steps)
 
-    def update_learning_rate(self, iteration):
+    def update_learning_rate(self, iteration, pbr_iteration):
         ''' Learning rate scheduling per step '''
         for param_group in self.optimizer.param_groups:
             if param_group["name"] == "xyz":
                 lr = self.xyz_scheduler_args(iteration)
                 param_group['lr'] = lr
-                return lr
-
+        if iteration > pbr_iteration:
+            self._xyz.requires_grad_(requires_grad=False)
+            self._features_dc.requires_grad_(requires_grad=False)
+            self._features_rest.requires_grad_(requires_grad=False)
+            self._opacity.requires_grad_(requires_grad=False)
+            self._scaling.requires_grad_(requires_grad=False)
+            self._rotation.requires_grad_(requires_grad=False)
+            self.pose_decoder.requires_grad_(requires_grad=False)
+            self.lweight_offset_decoder.requires_grad_(requires_grad=False)
+            self._normal.requires_grad_(requires_grad=False)
+            self._albedo.requires_grad_(requires_grad=True)
+            self._roughness.requires_grad_(requires_grad=True)
+            self._metallic.requires_grad_(requires_grad=True)
 
     def construct_list_of_attributes(self):
         l = ['x', 'y', 'z', 'nx', 'ny', 'nz']

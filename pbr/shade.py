@@ -7,6 +7,7 @@ import torch
 import torch.nn.functional as F
 
 from .light import CubemapLight
+import torchvision
 
 
 # Lazarov 2013, "Getting More Physical in Call of Duty: Black Ops II"
@@ -122,6 +123,8 @@ def pbr_shading(
 
     # prepare
     normals = normals.reshape(1, H, W, 3)
+    # torchvision.utils.save_image(normals.contiguous().reshape(H, W, 3).permute(2, 0, 1), os.path.join("check2.png"))
+    # exit()
     view_dirs = view_dirs.reshape(1, H, W, 3)
     albedo = albedo.reshape(1, H, W, 3)
     roughness = roughness.reshape(1, H, W, 1)
@@ -148,7 +151,7 @@ def pbr_shading(
     diffuse_rgb = diffuse_light * albedo  # [1, H, W, 3]
 
     # specular
-    NoV = saturate_dot(normals, view_dirs)  # [1, H, W, 1]
+    NoV = saturate_dot(normals, view_dirs)  # [1, H, W, 1] 法线与视线的点积
     fg_uv = torch.cat((NoV, roughness), dim=-1)  # [1, H, W, 2]
     fg_lookup = dr.texture(
         brdf_lut,  # [1, 256, 256, 2]
@@ -173,7 +176,7 @@ def pbr_shading(
         F0 = torch.ones_like(albedo) * 0.04  # [1, H, W, 3]
     else:
         F0 = (1.0 - metallic) * 0.04 + albedo * metallic
-    reflectance = F0 * fg_lookup[..., 0:1] + fg_lookup[..., 1:2]  # [1, H, W, 3]
+    reflectance = F0 * fg_lookup[..., 0:1] # + fg_lookup[..., 1:2]  # [1, H, W, 3]
     specular_rgb = spec * reflectance  # [1, H, W, 3]
 
     render_rgb = diffuse_rgb + specular_rgb  # [1, H, W, 3]
@@ -191,7 +194,7 @@ def pbr_shading(
     if gamma:
         render_rgb = linear_to_srgb(render_rgb.squeeze())
 
-    render_rgb = torch.where(mask, render_rgb, background)
+    render_rgb = torch.where(mask > 0, render_rgb, background)
 
     results.update(
         {

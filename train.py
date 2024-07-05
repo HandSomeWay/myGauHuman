@@ -38,9 +38,100 @@ loss_fn_vgg = lpips.LPIPS(net='vgg').to(torch.device('cuda', torch.cuda.current_
 
 import time
 import torch.nn.functional as F
+from pbr import CubemapLight, get_brdf_lut, pbr_shading
+from gs_ir import recon_occlusion, IrradianceVolumes
+from typing import Dict, List, Optional, Tuple, Union
+import nvdiffrast.torch as dr
 
+def get_tv_loss(
+    gt_image: torch.Tensor,  # [3, H, W]
+    prediction: torch.Tensor,  # [C, H, W]
+    pad: int = 1,
+    step: int = 1,
+) -> torch.Tensor:
+    if pad > 1:
+        gt_image = F.avg_pool2d(gt_image, pad, pad)
+        prediction = F.avg_pool2d(prediction, pad, pad)
+    rgb_grad_h = torch.exp(
+        -(gt_image[:, 1:, :] - gt_image[:, :-1, :]).abs().mean(dim=0, keepdim=True)
+    )  # [1, H-1, W]
+    rgb_grad_w = torch.exp(
+        -(gt_image[:, :, 1:] - gt_image[:, :, :-1]).abs().mean(dim=0, keepdim=True)
+    )  # [1, H-1, W]
+    tv_h = torch.pow(prediction[:, 1:, :] - prediction[:, :-1, :], 2)  # [C, H-1, W]
+    tv_w = torch.pow(prediction[:, :, 1:] - prediction[:, :, :-1], 2)  # [C, H, W-1]
+    tv_loss = (tv_h * rgb_grad_h).mean() + (tv_w * rgb_grad_w).mean()
+
+    if step > 1:
+        for s in range(2, step + 1):
+            rgb_grad_h = torch.exp(
+                -(gt_image[:, s:, :] - gt_image[:, :-s, :]).abs().mean(dim=0, keepdim=True)
+            )  # [1, H-1, W]
+            rgb_grad_w = torch.exp(
+                -(gt_image[:, :, s:] - gt_image[:, :, :-s]).abs().mean(dim=0, keepdim=True)
+            )  # [1, H-1, W]
+            tv_h = torch.pow(prediction[:, s:, :] - prediction[:, :-s, :], 2)  # [C, H-1, W]
+            tv_w = torch.pow(prediction[:, :, s:] - prediction[:, :, :-s], 2)  # [C, H, W-1]
+            tv_loss += (tv_h * rgb_grad_h).mean() + (tv_w * rgb_grad_w).mean()
+
+    return tv_loss
+
+
+def get_masked_tv_loss(
+    mask: torch.Tensor,  # [1, H, W]
+    gt_image: torch.Tensor,  # [3, H, W]
+    prediction: torch.Tensor,  # [C, H, W]
+    erosion: bool = False,
+) -> torch.Tensor:
+    rgb_grad_h = torch.exp(
+        -(gt_image[:, 1:, :] - gt_image[:, :-1, :]).abs().mean(dim=0, keepdim=True)
+    )  # [1, H-1, W]
+    rgb_grad_w = torch.exp(
+        -(gt_image[:, :, 1:] - gt_image[:, :, :-1]).abs().mean(dim=0, keepdim=True)
+    )  # [1, H-1, W]
+    tv_h = torch.pow(prediction[:, 1:, :] - prediction[:, :-1, :], 2)  # [C, H-1, W]
+    tv_w = torch.pow(prediction[:, :, 1:] - prediction[:, :, :-1], 2)  # [C, H, W-1]
+
+    # erode mask
+    mask = mask.float()
+    if erosion:
+        kernel = mask.new_ones([7, 7])
+        mask = kornia.morphology.erosion(mask[None, ...], kernel)[0]
+    mask_h = mask[:, 1:, :] * mask[:, :-1, :]  # [1, H-1, W]
+    mask_w = mask[:, :, 1:] * mask[:, :, :-1]  # [1, H, W-1]
+
+    tv_loss = (tv_h * rgb_grad_h * mask_h).mean() + (tv_w * rgb_grad_w * mask_w).mean()
+
+    return tv_loss
+
+
+def get_envmap_dirs(res: List[int] = [512, 1024]) -> torch.Tensor:
+    gy, gx = torch.meshgrid(
+        torch.linspace(0.0 + 1.0 / res[0], 1.0 - 1.0 / res[0], res[0], device="cuda"),
+        torch.linspace(-1.0 + 1.0 / res[1], 1.0 - 1.0 / res[1], res[1], device="cuda"),
+        indexing="ij",
+    )
+
+    sintheta, costheta = torch.sin(gy * np.pi), torch.cos(gy * np.pi)
+    sinphi, cosphi = torch.sin(gx * np.pi), torch.cos(gx * np.pi)
+
+    reflvec = torch.stack((sintheta * sinphi, costheta, -sintheta * cosphi), dim=-1)  # [H, W, 3]
+    return reflvec
+
+
+def resize_tensorboard_img(
+    img: torch.Tensor,  # [C, H, W]
+    max_res: int = 800,
+) -> torch.Tensor:
+    _, H, W = img.shape
+    ratio = min(max_res / H, max_res / W)
+    target_size = (int(H * ratio), int(W * ratio))
+    transform = T.Resize(size=target_size)
+    img = transform(img)  # [C, H', W']
+    return img
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from):
     first_iter = 0
+    pbr_iteration = 3000
     tb_writer = prepare_output_and_logger(dataset)
     gaussians = GaussianModel(dataset.sh_degree, dataset.smpl_type, dataset.motion_offset_flag, dataset.actor_gender)
     scene = Scene(dataset, gaussians)
@@ -55,13 +146,33 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     iter_start = torch.cuda.Event(enable_timing = True)
     iter_end = torch.cuda.Event(enable_timing = True)
 
+    bound = 1.5
+    # NOTE: prepare for PBR
+    brdf_lut = get_brdf_lut().cuda()
+    envmap_dirs = get_envmap_dirs()
+    cubemap = CubemapLight(base_res=256).cuda()
+    cubemap.train()
+    aabb = torch.tensor([-bound, -bound, -bound, bound, bound, bound]).cuda()
+    irradiance_volumes = IrradianceVolumes(aabb=aabb).cuda()
+    irradiance_volumes.train()
+    param_groups = [
+        {
+            "name": "irradiance_volumes",
+            "params": irradiance_volumes.parameters(),
+            "lr": opt.opacity_lr,
+        },
+        {"name": "cubemap", "params": cubemap.parameters(), "lr": opt.opacity_lr},
+    ]
+    light_optimizer = torch.optim.Adam(param_groups, lr=opt.opacity_lr)
+
+    canonical_rays = scene.get_canonical_rays()
     viewpoint_stack = None
     ema_loss_for_log = 0.0
     Ll1_loss_for_log = 0.0
     mask_loss_for_log = 0.0
-    ssim_loss_for_log = 0.0
-    lpips_loss_for_log = 0.0
-    normal_loss_for_log = 0.0
+    # ssim_loss_for_log = 0.0
+    # lpips_loss_for_log = 0.0
+    # normal_loss_for_log = 0.0
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
 
@@ -86,7 +197,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         iter_start.record()
 
-        gaussians.update_learning_rate(iteration)
+        gaussians.update_learning_rate(iteration, pbr_iteration)
 
         # Every 1000 its we increase the levels of SH up to a maximum degree
         if iteration % 1000 == 0:
@@ -99,6 +210,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         if not viewpoint_stack:
             viewpoint_stack = scene.getTrainCameras().copy()
         viewpoint_cam = viewpoint_stack.pop(randint(0, len(viewpoint_stack)-1))
+        try:
+            c2w = torch.inverse(viewpoint_cam.world_view_transform.T)  # [4, 4]
+        except:
+            continue
 
         # Render
         if (iteration - 1) == debug_from:
@@ -106,28 +221,107 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         render_pkg = render(viewpoint_cam, gaussians, pipe, background)
         image, alpha, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["render_alpha"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
         normal = render_pkg["normal"]
+        albedo = render_pkg["albedo"]
+        roughness = render_pkg["roughness"][0, ...].unsqueeze(0)
+        metallic = render_pkg["metallic"][0, ...].unsqueeze(0)
+        normal_mask = render_pkg["normal_mask"]
+        
+        # formulate roughness
+        rmax, rmin = 1.0, 0.04
+        roughness = roughness * (rmax - rmin) + rmin
+
+        # NOTE: mask normal map by view direction to avoid skip value
+        H, W = viewpoint_cam.image_height, viewpoint_cam.image_width
+        view_dirs = -(
+            (F.normalize(canonical_rays[:, None, :], p=2, dim=-1) * c2w[None, :3, :3])  # [HW, 3, 3]
+            .sum(dim=-1)
+            .reshape(H, W, 3)
+        )  # [H, W, 3]
+
 
         # Loss
         gt_normal = viewpoint_cam.original_normal.cuda()
         gt_image = viewpoint_cam.original_image.cuda()
         bkgd_mask = viewpoint_cam.bkgd_mask.cuda()
         bound_mask = viewpoint_cam.bound_mask.cuda()
-        Ll1 = l1_loss(image.permute(1,2,0)[bound_mask[0]==1], gt_image.permute(1,2,0)[bound_mask[0]==1])
-        mask_loss = l2_loss(alpha[bound_mask==1], bkgd_mask[bound_mask==1])
+        loss: torch.Tensor
+        
+        if iteration <= pbr_iteration:
 
-        # normal_loss = l1_loss(normal.permute(1,2,0)[bound_mask[0]==1], gt_normal.permute(1,2,0)[bound_mask[0]==1])
-        normal_loss = predicted_normal_loss(normal=normal, normal_ref=gt_normal, alpha=bound_mask)
+            Ll1 = l1_loss(image.permute(1,2,0)[bound_mask[0]==1], gt_image.permute(1,2,0)[bound_mask[0]==1])
+            mask_loss = l2_loss(alpha[bound_mask==1], bkgd_mask[bound_mask==1])
 
-        # crop the object region
-        x, y, w, h = cv2.boundingRect(bound_mask[0].cpu().numpy().astype(np.uint8))
-        img_pred = image[:, y:y + h, x:x + w].unsqueeze(0)
-        img_gt = gt_image[:, y:y + h, x:x + w].unsqueeze(0)
-        # ssim loss
-        ssim_loss = ssim(img_pred, img_gt)
-        # lipis loss
-        lpips_loss = loss_fn_vgg(img_pred, img_gt).reshape(-1)
+            # normal_loss = l1_loss(normal.permute(1,2,0)[bound_mask[0]==1], gt_normal.permute(1,2,0)[bound_mask[0]==1])
+            normal_loss = predicted_normal_loss(normal=normal, normal_ref=gt_normal, alpha=bound_mask)
 
-        loss = Ll1 + 0.1 * mask_loss + 0.01 * (1.0 - ssim_loss) + 0.01 * lpips_loss + 0.1 * normal_loss
+            # crop the object region
+            x, y, w, h = cv2.boundingRect(bound_mask[0].cpu().numpy().astype(np.uint8))
+            img_pred = image[:, y:y + h, x:x + w].unsqueeze(0)
+            img_gt = gt_image[:, y:y + h, x:x + w].unsqueeze(0)
+            # ssim loss
+            ssim_loss = ssim(img_pred, img_gt)
+            # lipis loss
+            lpips_loss = loss_fn_vgg(img_pred, img_gt).reshape(-1)
+
+            loss = Ll1 + 0.1 * mask_loss + 0.01 * (1.0 - ssim_loss) + 0.01 * lpips_loss + 0.1 * normal_loss
+        else: # NOTE: PBR
+            occlusion = torch.ones_like(roughness).permute(1, 2, 0)  # [H, W, 1]
+            irradiance = torch.zeros_like(roughness).permute(1, 2, 0)  # [H, W, 1]
+            cubemap.build_mips() # build mip for environment light
+            pbr_result = pbr_shading(
+                light=cubemap,
+                normals=normal.permute(1, 2, 0).detach(),  # [H, W, 3]
+                view_dirs=view_dirs,
+                mask=alpha.permute(1, 2, 0),  # [H, W, 1]
+                albedo=albedo.permute(1, 2, 0),  # [H, W, 3]
+                roughness=roughness.permute(1, 2, 0),  # [H, W, 1]
+                metallic=metallic.permute(1, 2, 0) if (metallic is not None) else None,  # [H, W, 1]
+                tone=False,
+                gamma=False,
+                occlusion=None,#occlusion,
+                irradiance=irradiance,
+                brdf_lut=brdf_lut,
+            )
+            render_rgb = pbr_result["render_rgb"].permute(2, 0, 1)  # [3, H, W]
+            Ll1 = l1_loss(render_rgb.permute(1,2,0)[bound_mask[0]==1], gt_image.permute(1,2,0)[bound_mask[0]==1])
+            mask_loss = l2_loss(alpha[bound_mask==1], bkgd_mask[bound_mask==1])
+            normal_loss = predicted_normal_loss(normal=normal, normal_ref=gt_normal, alpha=bound_mask)
+            loss = Ll1 + 0.1 * mask_loss + 0.1 * normal_loss
+
+            ### BRDF loss
+            if (alpha == 0).sum() > 0:
+                brdf_tv_loss = get_masked_tv_loss(
+                    alpha,
+                    gt_image,  # [3, H, W]
+                    torch.cat([albedo, roughness, metallic], dim=0),  # [5, H, W]
+                )
+            else:
+                brdf_tv_loss = get_tv_loss(
+                    gt_image,  # [3, H, W]
+                    torch.cat([albedo, roughness, metallic], dim=0),  # [5, H, W]
+                    pad=1,  # FIXME: 8 for scene
+                    step=1,
+                )
+            loss += brdf_tv_loss * 1.0
+            lamb_loss = (1.0 - roughness[alpha > 0]).mean() + metallic[alpha > 0].mean()
+            loss += lamb_loss * 0.001
+
+            #### envmap
+            # TV smoothness
+            envmap = dr.texture(
+                cubemap.base[None, ...],
+                envmap_dirs[None, ...].contiguous(),
+                filter_mode="linear",
+                boundary_mode="cube",
+            )[
+                0
+            ]  # [H, W, 3]
+            tv_h1 = torch.pow(envmap[1:, :, :] - envmap[:-1, :, :], 2).mean()
+            tv_w1 = torch.pow(envmap[:, 1:, :] - envmap[:, :-1, :], 2).mean()
+            env_tv_loss = tv_h1 + tv_w1
+            env_tv_weight = 0.01
+            loss += env_tv_loss * env_tv_weight
+
         loss.backward()
 
         # end time
@@ -145,12 +339,12 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
             Ll1_loss_for_log = 0.4 * Ll1.item() + 0.6 * Ll1_loss_for_log
             mask_loss_for_log = 0.4 * mask_loss.item() + 0.6 * mask_loss_for_log
-            ssim_loss_for_log = 0.4 * ssim_loss.item() + 0.6 * ssim_loss_for_log
-            lpips_loss_for_log = 0.4 * lpips_loss.item() + 0.6 * lpips_loss_for_log
-            normal_loss_for_log = 0.4 * normal_loss.item() + 0.6 * normal_loss_for_log
+            # ssim_loss_for_log = 0.4 * ssim_loss.item() + 0.6 * ssim_loss_for_log
+            # lpips_loss_for_log = 0.4 * lpips_loss.item() + 0.6 * lpips_loss_for_log
+            # normal_loss_for_log = 0.4 * normal_loss.item() + 0.6 * normal_loss_for_log
             if iteration % 10 == 0:
-                progress_bar.set_postfix({"#pts": gaussians._xyz.shape[0], "Ll1 Loss": f"{Ll1_loss_for_log:.{3}f}", "mask Loss": f"{mask_loss_for_log:.{2}f}",
-                                          "ssim": f"{ssim_loss_for_log:.{2}f}", "lpips": f"{lpips_loss_for_log:.{2}f}", "normal":f"{normal_loss_for_log:.{2}f}"})
+                progress_bar.set_postfix({"#pts": gaussians._xyz.shape[0], "Ll1 Loss": f"{Ll1_loss_for_log:.{3}f}", "mask Loss": f"{mask_loss_for_log:.{2}f}"})
+                                        #   "ssim": f"{ssim_loss_for_log:.{2}f}", "lpips": f"{lpips_loss_for_log:.{2}f}", "normal":f"{normal_loss_for_log:.{2}f}"})
                 progress_bar.update(10)
             if iteration == opt.iterations:
                 progress_bar.close()
@@ -177,11 +371,16 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 
                 if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
                     gaussians.reset_opacity()
-
+            
+            gaussians.update_learning_rate(iteration, pbr_iteration)
             # Optimizer step
             if iteration < opt.iterations:
                 gaussians.optimizer.step()
                 gaussians.optimizer.zero_grad(set_to_none = True)
+                if iteration >= pbr_iteration:
+                    light_optimizer.step()
+                    light_optimizer.zero_grad(set_to_none=True)
+                    cubemap.clamp_(min=0.0)
 
             # end time
             end_time = time.time()
@@ -192,6 +391,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             if (iteration in testing_iterations):
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))
                 torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
+                torch.save({"cubemap":cubemap.state_dict(),}, scene.model_path + "/env_map" + str(iteration) + ".pth")
         
 def prepare_output_and_logger(args):    
     if not args.model_path:
@@ -291,8 +491,8 @@ if __name__ == "__main__":
     parser.add_argument('--port', type=int, default=6009)
     parser.add_argument('--debug_from', type=int, default=-1)
     parser.add_argument('--detect_anomaly', action='store_true', default=False)
-    parser.add_argument("--test_iterations", nargs="+", type=int, default=[1_200, 2_000, 3_000, 7_000, 30_000])
-    parser.add_argument("--save_iterations", nargs="+", type=int, default= [1_200, 2_000, 3_000, 7_000, 30_000])
+    parser.add_argument("--test_iterations", nargs="+", type=int, default=[1_200, 2_000, 3_000, 5_000, 7_000, 30_000])
+    parser.add_argument("--save_iterations", nargs="+", type=int, default= [1_200, 2_000, 3_000, 5_000, 7_000, 30_000])
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
     parser.add_argument("--start_checkpoint", type=str, default = None)

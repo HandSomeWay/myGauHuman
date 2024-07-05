@@ -173,6 +173,8 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         scales = scales,
         rotations = rotations,
         cov3D_precomp = cov3D_precomp)
+    
+    normal_mask = (rendered_normal != 0).all(0, keepdim=True)
     # Those Gaussians that were frustum culled or had a radius of 0 were not visible.
     # They will be excluded from value updates used in the splitting criteria.
     return {"render": rendered_image,
@@ -188,4 +190,5 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
             "albedo": rendered_albedo,
             "roughness":rendered_roughness,
             "metallic":rendered_metallic,
+            "normal_mask":normal_mask
             }
