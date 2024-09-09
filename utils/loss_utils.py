@@ -82,8 +82,30 @@ def predicted_normal_loss(normal, normal_ref, alpha=None):
         weight = torch.ones_like(normal_ref)
 
     w = weight.permute(1,2,0).reshape(-1,3)[...,0].detach()
+    # print("normal_ref" , normal_ref.shape)
     n = normal_ref.permute(1,2,0).reshape(-1,3).detach()    #(HxW, 3)
     n_pred = normal.permute(1,2,0).reshape(-1,3)    #(HxW, 3)
     loss = (w * (1.0 - torch.sum(n * n_pred, axis=-1))).mean()
+
+    return loss
+
+def delta_normal_loss(delta_normal_norm, alpha=None):
+    # delta_normal_norm: (3, H, W), alpha: (3, H, W)
+    if alpha is not None:
+        device = alpha.device
+        weight = alpha.detach().cpu().numpy()[0]
+        weight = (weight*255).astype(np.uint8)
+
+        weight = erode(weight, erode_size=4)
+
+        weight = torch.from_numpy(weight.astype(np.float32)/255.)
+        weight = weight[None,...].repeat(3,1,1)
+        weight = weight.to(device) 
+    else:
+        weight = torch.ones_like(delta_normal_norm)
+
+    w = weight.permute(1,2,0).reshape(-1,3)[...,0].detach()
+    l = delta_normal_norm.permute(1,2,0).reshape(-1,3)[...,0]
+    loss = (w * l).mean()
 
     return loss

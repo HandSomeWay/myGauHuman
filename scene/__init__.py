@@ -52,6 +52,9 @@ class Scene:
         elif 'zju_mocap_refine' in args.source_path: #os.path.exists(os.path.join(args.source_path, "annots.npy")):
             print("Found annots.json file, assuming ZJU_MoCap_refine data set!")
             scene_info = sceneLoadTypeCallbacks["ZJU_MoCap_refine"](args.source_path, args.white_background, args.exp_name, args.eval)
+        elif os.path.exists(os.path.join(args.source_path, "annots.npy")):
+            print("Found annots.json file, assuming Render data set!")
+            scene_info = sceneLoadTypeCallbacks["Render"](args.source_path, args.white_background, args.exp_name, args.eval)
         elif 'monocap' in args.source_path:
             print("assuming MonoCap data set!")
             scene_info = sceneLoadTypeCallbacks["MonoCap"](args.source_path, args.white_background, args.exp_name, args.eval)
@@ -101,6 +104,7 @@ class Scene:
                 ckpt = torch.load(model_path, map_location='cuda:0')
                 self.gaussians.pose_decoder.load_state_dict(ckpt['pose_decoder'])
                 self.gaussians.lweight_offset_decoder.load_state_dict(ckpt['lweight_offset_decoder'])
+                self.gaussians.occ_decoder.load_state_dict(ckpt['occ_decoder'])
 
     def save(self, iteration):
         point_cloud_path = os.path.join(self.model_path, "point_cloud/iteration_{}".format(iteration))
@@ -113,6 +117,7 @@ class Scene:
                 'iter': iteration,
                 'pose_decoder': self.gaussians.pose_decoder.state_dict(),
                 'lweight_offset_decoder': self.gaussians.lweight_offset_decoder.state_dict(),
+                'occ_decoder': self.gaussians.occ_decoder.state_dict(),
             }, model_path)
 
     def getTrainCameras(self, scale=1.0):

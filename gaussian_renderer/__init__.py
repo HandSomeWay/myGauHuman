@@ -9,12 +9,26 @@
 # For inquiries contact  george.drettakis@inria.fr
 #
 
+import numpy as np
 from transform import transformVector3x3
 import torch
 import math
 from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianRasterizer
 from scene.gaussian_model import GaussianModel
 from utils.sh_utils import eval_sh
+from utils.graphics_utils import normal_from_depth_image
+
+def render_normal(viewpoint_cam, depth, bg_color, alpha):
+    # depth: (H, W), bg_color: (3), alpha: (H, W)
+    # normal_ref: (3, H, W)
+    intrinsic_matrix, extrinsic_matrix = viewpoint_cam.get_calib_matrix_nerf()
+
+    normal_ref = normal_from_depth_image(depth, intrinsic_matrix.to(depth.device), extrinsic_matrix.to(depth.device))
+    background = bg_color[None,None,...]
+    normal_ref = normal_ref*alpha[...,None] + background*(1. - alpha[...,None])
+ 
+    normal_ref = normal_ref.squeeze(0).permute(2,0,1)
+    return normal_ref
 
 def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, override_color = None, return_smpl_rot=False, transforms=None, translation=None):
     """
@@ -34,9 +48,12 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     tanfovx = math.tan(viewpoint_camera.FoVx * 0.5)
     tanfovy = math.tan(viewpoint_camera.FoVy * 0.5)
 
+    H = int(viewpoint_camera.image_height)
+    W = int(viewpoint_camera.image_width)
+
     raster_settings = GaussianRasterizationSettings(
-        image_height=int(viewpoint_camera.image_height),
-        image_width=int(viewpoint_camera.image_width),
+        image_height=H,
+        image_width=W,
         tanfovx=tanfovx,
         tanfovy=tanfovy,
         bg=bg_color,
@@ -51,7 +68,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
 
     rasterizer = GaussianRasterizer(raster_settings=raster_settings)
     means3D = pc.get_xyz
-    normal = pc.get_normal()
+    normal, delta_normal = pc.get_normal()
     if not pc.motion_offset_flag:
         _, means3D, _, transforms, _, world_normal = pc.coarse_deform_c2source(means3D[None], viewpoint_camera.smpl_param,
             viewpoint_camera.big_pose_smpl_param,
@@ -59,7 +76,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     else:
         if transforms is None:
             # pose offset
-            dst_posevec = viewpoint_camera.smpl_param['poses'][:, 3:]
+            dst_posevec = viewpoint_camera.smpl_param['poses'][:, 3:] #[1, 69]--[1, 3 * 23]
             pose_out = pc.pose_decoder(dst_posevec)
             correct_Rs = pose_out['Rs']
 
@@ -82,6 +99,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     albedo = pc.get_albedo
     roughness = pc.get_roughness
     metallic = pc.get_metallic
+    occlusion = pc.get_occlusion
     assert albedo.shape[0] == roughness.shape[0] and albedo.shape[0] == metallic.shape[0]
 
     viewmatrix = viewpoint_camera.world_view_transform
@@ -93,7 +111,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     # normal = pc.get_normal(dir_pp_normalized, transforms)  
     normal = transformVector3x3(world_normal, viewmatrix)
     normal = (normal * 0.5) + 0.5
-    normal = normal[:, [2, 0, 1]]
+    # normal = normal[:, [2, 0, 1]]
 
     # If precomputed 3d covariance is provided, use it. If not, then it will be computed from
     # scaling / rotation by the rasterizer.
@@ -173,8 +191,23 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         scales = scales,
         rotations = rotations,
         cov3D_precomp = cov3D_precomp)
+    rendered_occlusion, *_ = rasterizer(
+        means3D = means3D,
+        means2D = means2D,
+        shs = shs,
+        colors_precomp = occlusion.repeat(1, 3),
+        opacities = opacity,
+        scales = scales,
+        rotations = rotations,
+        cov3D_precomp = cov3D_precomp)
     
-    normal_mask = (rendered_normal != 0).all(0, keepdim=True)
+    viewmatrix = viewpoint_camera.world_view_transform
+    normal_ref = render_normal(viewpoint_cam=viewpoint_camera, depth=depth, bg_color=bg_color, alpha=alpha)
+
+    normal_ref = transformVector3x3(normal_ref.permute(1, 2, 0).reshape(H * W, 3), viewmatrix).permute(1, 0).reshape(3, H, W)
+    normal_ref = (normal_ref * 0.5) + 0.5
+    occ = pc.occ_decoder(torch.cat((rendered_normal, depth), dim=0).unsqueeze(0)).squeeze(0)
+    # print(normal_ref.shape)
     # Those Gaussians that were frustum culled or had a radius of 0 were not visible.
     # They will be excluded from value updates used in the splitting criteria.
     return {"render": rendered_image,
@@ -190,5 +223,6 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
             "albedo": rendered_albedo,
             "roughness":rendered_roughness,
             "metallic":rendered_metallic,
-            "normal_mask":normal_mask
-            }
+            "occlusion":rendered_occlusion,
+            "occ":occ,
+            "normal_ref": normal_ref,}

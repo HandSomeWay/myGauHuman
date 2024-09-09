@@ -18,14 +18,14 @@ def recon_occlusion(
 ) -> torch.Tensor:
     occlu_res = occlusion_ids.shape[0]
     half_grid = bound / float(occlu_res)
-    shift_points = points + normals * half_grid
+    shift_points = points + normals * half_grid #[HW, 3]
     # shift_points = points
     (
         coefficients,  # [HW, d2, 1]
         coeff_ids,  # [HW, 8]
     ) = _C.sparse_interpolate_coefficients(
-        occlusion_coefficients,
-        occlusion_ids,
+        occlusion_coefficients, #[N, 16, 1]
+        occlusion_ids,  #[res, res, res]
         aabb,
         shift_points,
         normals,

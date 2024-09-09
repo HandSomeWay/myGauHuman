@@ -1,129 +1,101 @@
-#
-# Copyright (C) 2023, Inria
-# GRAPHDECO research group, https://team.inria.fr/graphdeco
-# All rights reserved.
-#
-# This software is free for non-commercial, research and evaluation use 
-# under the terms of the LICENSE.md file.
-#
-# For inquiries contact  george.drettakis@inria.fr
-#
-
 import torch
-from scene import Scene
-import os
-import time
-import pickle
-from tqdm import tqdm
-from os import makedirs
-from gaussian_renderer import render
-import torchvision
-from utils.general_utils import safe_state
-from argparse import ArgumentParser
-from arguments import ModelParams, PipelineParams, get_combined_args
-from gaussian_renderer import GaussianModel
+import torch.nn.functional as F
+from torchvision import transforms, datasets
 
-from utils.image_utils import psnr
-from utils.loss_utils import ssim
-import lpips
-loss_fn_vgg = lpips.LPIPS(net='vgg').to(torch.device('cuda', torch.cuda.current_device()))
+def SSAO(depth_map, normal_map, kernel_size=32, radius=0.5):
+    transform = transforms.Compose([
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),  # 标准化
+    ])
+    depth_map = transform(depth_map)[0, :, :]
+    normal_map = transform(normal_map).permute(1, 2 ,0)
+    H, W = depth_map.shape[0], depth_map.shape[1]
 
-def render_set(model_path, name, iteration, views, gaussians, pipeline, background):
-    render_path = os.path.join(model_path, name, "ours_{}".format(iteration), "renders")
-    gts_path = os.path.join(model_path, name, "ours_{}".format(iteration), "gt")
-    normal_path = os.path.join(model_path, name, "ours_{}".format(iteration), "normal")
-    render_normal_path = os.path.join(model_path, name, "ours_{}".format(iteration), "render_normal")
+    # 创建一个随机的采样核
+    kernel = torch.rand((kernel_size, 2), device=depth_map.device) * 2 - 1
+    kernel = kernel / torch.norm(kernel, dim=1, keepdim=True)
+    kernel = kernel * radius
 
-    makedirs(render_path, exist_ok=True)
-    makedirs(gts_path, exist_ok=True)
-    makedirs(normal_path, exist_ok=True)
-    makedirs(render_normal_path, exist_ok=True)
+    # 初始化输出遮蔽图
+    occlusion = torch.zeros((H, W), dtype=torch.float32, device=depth_map.device)
 
-    # Load data (deserialize)
-    with open(model_path + '/smpl_rot/' + f'iteration_{iteration}/' + 'smpl_rot.pickle', 'rb') as handle:
-        smpl_rot = pickle.load(handle)
+    # 扩展法线图和深度图以便进行采样
+    normal_map = normal_map.permute(2, 0, 1).unsqueeze(0)  # 变换为 (1, 3, H, W)
+    depth_map = depth_map.unsqueeze(0).unsqueeze(0)  # 变换为 (1, 1, H, W)
 
-    rgbs = []
-    rgbs_gt = []
-    rgbs_normal = []
-    rgbs_normal_rd = []
-    elapsed_time = 0
+    # 对每个采样点进行SSAO操作
+    for i in range(kernel_size):
+        offset = kernel[i]
 
-    for _, view in enumerate(tqdm(views, desc="Rendering progress")):
-        gt = view.original_image[0:3, :, :].cuda()
+        # 计算采样坐标
+        y, x = torch.meshgrid(torch.linspace(-1, 1, H, device=depth_map.device), 
+                              torch.linspace(-1, 1, W, device=depth_map.device), 
+                              indexing='ij')
+        grid = torch.stack([x, y], dim=-1)  # 生成网格坐标
+        grid = grid + offset  # 添加偏移量
+        grid = grid.unsqueeze(0)  # 变换为 (1, H, W, 2)
 
-        normal = view.original_normal[0:3, :, :].cuda()
+        # 对深度图和法线图进行采样
+        sampled_depth_map = F.grid_sample(depth_map, grid, align_corners=True, mode='bilinear', padding_mode='border')
+        sampled_normal_map = F.grid_sample(normal_map, grid, align_corners=True, mode='bilinear', padding_mode='border')
 
-        bound_mask = view.bound_mask
-        transforms, translation = smpl_rot[name][view.pose_id]['transforms'], smpl_rot[name][view.pose_id]['translation']
+        # 计算向量
+        vec = torch.cat([
+            (grid[..., 0] * (W - 1) / 2).unsqueeze(1),
+            (grid[..., 1] * (H - 1) / 2).unsqueeze(1),
+            sampled_depth_map - depth_map
+        ], dim=1)
+        vec = vec / torch.norm(vec, dim=1, keepdim=True)
 
-        # Start timer
-        start_time = time.time() 
-        render_output = render(view, gaussians, pipeline, background, transforms=transforms, translation=translation)
-        rendering = render_output["render"]
-        render_normal = render_output["normal"]
-        
-        # end time
-        end_time = time.time()
-        # Calculate elapsed time
-        elapsed_time += end_time - start_time
+        # 计算遮蔽因子
+        center_normal = normal_map
+        ao = torch.clamp(torch.sum(center_normal * vec, dim=1), min=0.0)
 
-        rendering.permute(1,2,0)[bound_mask[0]==0] = 0 if background.sum().item() == 0 else 1
-        render_normal.permute(1,2,0)[bound_mask[0]==0] = 0 if background.sum().item() == 0 else 1
+        # 累加遮蔽因子
+        occlusion += ao.squeeze(0)
 
-        rgbs.append(rendering)
-        rgbs_gt.append(gt)
-        rgbs_normal.append(normal)
-        rgbs_normal_rd.append(render_normal)
+    # 平均遮蔽因子
+    occlusion /= kernel_size
 
-    # Calculate elapsed time
-    print("Elapsed time: ", elapsed_time, " FPS: ", len(views)/elapsed_time) 
+    # 归一化遮蔽图
+    occlusion = (occlusion - occlusion.min()) / (occlusion.max() - occlusion.min())
+
+    return occlusion.unsqueeze(0).unsqueeze(0)  # 增加通道和批量大小维度
 
 
+def check():
+    normal_path = "/home/shangwei/codes/myGauHuman/output/zju_mocap_refine/my_377_env/test/ours_5000/render_normal/00321.png"
 
-    for id in range(len(views)):
-        rendering = rgbs[id]
-        gt = rgbs_gt[id]
-        normal = rgbs_normal[id]
-        render_normal = rgbs_normal_rd[id]
+    transform = transforms.Compose([
+        transforms.Resize((512, 512)),  # 调整图片大小
+        transforms.ToTensor(),           # 将图片转换为张量
+        # transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),  # 标准化
+    ])
 
-        rendering = torch.clamp(rendering, 0.0, 1.0)
-        gt = torch.clamp(gt, 0.0, 1.0)
-        normal = torch.clamp(normal, 0.0, 1.0)
-        render_normal = torch.clamp(render_normal, 0.0, 1.0)
-        torchvision.utils.save_image(rendering, os.path.join(render_path, '{0:05d}'.format(id) + ".png"))
-        torchvision.utils.save_image(gt, os.path.join(gts_path, '{0:05d}'.format(id) + ".png"))
-        torchvision.utils.save_image(normal, os.path.join(normal_path, '{0:05d}'.format(id) + ".png"))
-        torchvision.utils.save_image(render_normal, os.path.join(render_normal_path, '{0:05d}'.format(id) + ".png"))
+    from PIL import Image
+    # 读取图片
+    normal = Image.open(normal_path)
 
+    # 应用转换
+    N = transform(normal).cuda()    #[3, H, W]
 
-def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParams, skip_train : bool, skip_test : bool):
-    with torch.no_grad():
-        gaussians = GaussianModel(dataset.sh_degree, dataset.smpl_type, dataset.motion_offset_flag, dataset.actor_gender)
-        scene = Scene(dataset, gaussians, load_iteration=iteration, shuffle=False)
+    depth_path = "/home/shangwei/codes/myGauHuman/output/zju_mocap_refine/my_377_env/test/ours_5000/render_depth/00321.png"
+    # 读取图片
+    depth = Image.open(depth_path)
 
-        bg_color = [1,1,1] if dataset.white_background else [0, 0, 0]
-        background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
+    # 应用转换
+    D = transform(depth).cuda()    #[H, W]
+    # 假设D和N已经被加载为PyTorch张量，并且已经移动到相应的设备上（如GPU）
+    # D[H, W, 1] - 深度图
+    # N[H, W, 3] - 法线图
+    ssao_map = SSAO(D, N)
+    ssao_map.squeeze(0)
+    from torchvision.utils import save_image
+    save_image(D, 'imD.png')
+    save_image(N, 'imN.png')
+    print(D.max())
 
-        if not skip_train:
-             render_set(dataset.model_path, "train", scene.loaded_iter, scene.getTrainCameras(), gaussians, pipeline, background)
+    save_image(1 - ssao_map, 'image1.png')
+    # 打印结果
+    # print(ssao_map.shape)  # 应该是 [1, 1, H, W]
 
-        if not skip_test:
-             render_set(dataset.model_path, "test", scene.loaded_iter, scene.getTestCameras(), gaussians, pipeline, background)
-
-if __name__ == "__main__":
-    # Set up command line argument parser
-    parser = ArgumentParser(description="Testing script parameters")
-    model = ModelParams(parser, sentinel=True)
-    pipeline = PipelineParams(parser)
-    parser.add_argument("--iteration", default=-1, type=int)
-    parser.add_argument("--skip_train", action="store_true")
-    parser.add_argument("--skip_test", action="store_true")
-    parser.add_argument("--quiet", action="store_true")
-    args = get_combined_args(parser)
-    print("Rendering " + args.model_path)
-
-    # Initialize system state (RNG)
-    safe_state(args.quiet)
-
-    render_sets(model.extract(args), args.iteration, pipeline.extract(args), args.skip_train, args.skip_test)
+# check()

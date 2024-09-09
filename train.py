@@ -13,7 +13,7 @@
 import os
 import torch
 from random import randint
-from utils.loss_utils import l1_loss, l2_loss, ssim, predicted_normal_loss
+from utils.loss_utils import l1_loss, l2_loss, ssim, predicted_normal_loss, delta_normal_loss
 from gaussian_renderer import render, network_gui
 import sys
 from scene import Scene, GaussianModel
@@ -42,6 +42,12 @@ from pbr import CubemapLight, get_brdf_lut, pbr_shading
 from gs_ir import recon_occlusion, IrradianceVolumes
 from typing import Dict, List, Optional, Tuple, Union
 import nvdiffrast.torch as dr
+
+def zero_one_loss(img):
+    zero_epsilon = 1e-3
+    val = torch.clamp(img, zero_epsilon, 1 - zero_epsilon)
+    loss = torch.mean(torch.log(val) + torch.log(1 - val))
+    return loss
 
 def get_tv_loss(
     gt_image: torch.Tensor,  # [3, H, W]
@@ -220,11 +226,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             pipe.debug = True
         render_pkg = render(viewpoint_cam, gaussians, pipe, background)
         image, alpha, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["render_alpha"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
+        normal_ref = render_pkg["normal_ref"]
         normal = render_pkg["normal"]
         albedo = render_pkg["albedo"]
         roughness = render_pkg["roughness"][0, ...].unsqueeze(0)
         metallic = render_pkg["metallic"][0, ...].unsqueeze(0)
-        normal_mask = render_pkg["normal_mask"]
         
         # formulate roughness
         rmax, rmin = 1.0, 0.04
@@ -249,23 +255,43 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         if iteration <= pbr_iteration:
 
             Ll1 = l1_loss(image.permute(1,2,0)[bound_mask[0]==1], gt_image.permute(1,2,0)[bound_mask[0]==1])
-            mask_loss = l2_loss(alpha[bound_mask==1], bkgd_mask[bound_mask==1])
+            mask_loss = l2_loss(alpha[bound_mask==1], (bkgd_mask[0].unsqueeze(0))[bound_mask==1])
 
+            scaling = gaussians.get_scaling
+        
+            scale_loss = torch.sum(torch.max(scaling-0.005, torch.zeros_like(scaling)))
             # normal_loss = l1_loss(normal.permute(1,2,0)[bound_mask[0]==1], gt_normal.permute(1,2,0)[bound_mask[0]==1])
-            normal_loss = predicted_normal_loss(normal=normal, normal_ref=gt_normal, alpha=bound_mask)
+            normal_loss = predicted_normal_loss(normal=normal, normal_ref=normal_ref, alpha=bound_mask)
 
             # crop the object region
             x, y, w, h = cv2.boundingRect(bound_mask[0].cpu().numpy().astype(np.uint8))
             img_pred = image[:, y:y + h, x:x + w].unsqueeze(0)
             img_gt = gt_image[:, y:y + h, x:x + w].unsqueeze(0)
+            normal_pred = normal[:, y:y + h, x:x + w].unsqueeze(0)
+            normal_gt = gt_normal[:, y:y + h, x:x + w].unsqueeze(0)
             # ssim loss
-            ssim_loss = ssim(img_pred, img_gt)
+            # ssim_loss = ssim(img_pred, img_gt)
+            # ssim_loss = ssim(normal_pred, normal_gt)
             # lipis loss
-            lpips_loss = loss_fn_vgg(img_pred, img_gt).reshape(-1)
+            # lpips_loss = loss_fn_vgg(img_pred, img_gt).reshape(-1)
+            # lpips_loss = loss_fn_vgg(normal_pred, normal_gt).reshape(-1)
+            zero_one = zero_one_loss(render_pkg["render_alpha"])
 
-            loss = Ll1 + 0.1 * mask_loss + 0.01 * (1.0 - ssim_loss) + 0.01 * lpips_loss + 0.1 * normal_loss
+            loss = Ll1 + 0.1 * mask_loss + 0.03 * zero_one + 0.01 * normal_loss +  0 * scale_loss#+ 0.01 * lpips_loss  + 0.01 * (1.0 - ssim_loss)
         else: # NOTE: PBR
-            occlusion = torch.ones_like(roughness).permute(1, 2, 0)  # [H, W, 1]
+            import AOrender
+            # occlusion = 1 - AOrender.SSAO(render_pkg["render_depth"].repeat(3, 1, 1), normal).squeeze(0).permute(1, 2, 0)
+            occlusion = 1 - AOrender.SSAO(render_pkg["render_depth"].repeat(3, 1, 1), normal).squeeze(0).permute(1, 2, 0)
+            # from torchvision.utils import save_image
+            # print(render_pkg["render_depth"].max())
+            # save_image(render_pkg["render_depth"].squeeze(0), 'imageD.png')
+            # save_image(normal, 'imageN.png')
+            # save_image((1 - occlusion).permute(2, 0, 1), 'image.png')
+            # exit()
+            # print(occlusion.shape)
+            # occlusion = torch.ones_like(roughness).permute(1, 2, 0)  # [H, W, 1]
+            # occlusion = render_pkg["occlusion"][0, ...].unsqueeze(0).permute(1, 2, 0)
+            # occlusion = render_pkg["occ"].permute(1, 2, 0)
             irradiance = torch.zeros_like(roughness).permute(1, 2, 0)  # [H, W, 1]
             cubemap.build_mips() # build mip for environment light
             pbr_result = pbr_shading(
@@ -278,15 +304,19 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 metallic=metallic.permute(1, 2, 0) if (metallic is not None) else None,  # [H, W, 1]
                 tone=False,
                 gamma=False,
-                occlusion=None,#occlusion,
+                occlusion=occlusion,
                 irradiance=irradiance,
                 brdf_lut=brdf_lut,
             )
             render_rgb = pbr_result["render_rgb"].permute(2, 0, 1)  # [3, H, W]
             Ll1 = l1_loss(render_rgb.permute(1,2,0)[bound_mask[0]==1], gt_image.permute(1,2,0)[bound_mask[0]==1])
-            mask_loss = l2_loss(alpha[bound_mask==1], bkgd_mask[bound_mask==1])
-            normal_loss = predicted_normal_loss(normal=normal, normal_ref=gt_normal, alpha=bound_mask)
-            loss = Ll1 + 0.1 * mask_loss + 0.1 * normal_loss
+            
+            x, y, w, h = cv2.boundingRect(bound_mask[0].cpu().numpy().astype(np.uint8))
+            img_pred = render_rgb[:, y:y + h, x:x + w].unsqueeze(0)
+            img_gt = gt_image[:, y:y + h, x:x + w].unsqueeze(0)
+            ssim_loss = ssim(img_pred, img_gt)
+            lpips_loss = loss_fn_vgg(img_pred, img_gt).reshape(-1)
+            loss = Ll1 + 0.01 * (1.0 - ssim_loss) + 0.01 * lpips_loss
 
             ### BRDF loss
             if (alpha == 0).sum() > 0:
@@ -444,6 +474,7 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
                     smpl_rot[config['name']][viewpoint.pose_id] = {}
                     render_output = renderFunc(viewpoint, scene.gaussians, *renderArgs, return_smpl_rot=True)
                     image = torch.clamp(render_output["render"], 0.0, 1.0)
+
                     gt_image = torch.clamp(viewpoint.original_image.to("cuda"), 0.0, 1.0)
                     bound_mask = viewpoint.bound_mask
                     image.permute(1,2,0)[bound_mask[0]==0] = 0 if renderArgs[1].sum().item() == 0 else 1 
@@ -455,6 +486,7 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
                     psnr_test += psnr(image, gt_image).mean().double()
                     ssim_test += ssim(image, gt_image).mean().double()
                     lpips_test += loss_fn_vgg(image, gt_image).mean().double()
+                    
 
                     smpl_rot[config['name']][viewpoint.pose_id]['transforms'] = render_output['transforms']
                     smpl_rot[config['name']][viewpoint.pose_id]['translation'] = render_output['translation']

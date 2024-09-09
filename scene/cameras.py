@@ -12,7 +12,7 @@
 import torch
 from torch import nn
 import numpy as np
-from utils.graphics_utils import getWorld2View2, getProjectionMatrix, getProjectionMatrix_refine
+from utils.graphics_utils import getWorld2View2, getProjectionMatrix, getProjectionMatrix_refine, fov2focal
 
 class Camera(nn.Module):
     def __init__(self, colmap_id, pose_id, R, T, K, FoVx, FoVy, image, gt_alpha_mask,
@@ -73,7 +73,11 @@ class Camera(nn.Module):
         self.big_pose_smpl_param = smpl_to_cuda(big_pose_smpl_param, self.data_device)
         self.big_pose_world_vertex = torch.tensor(big_pose_world_vertex).to(self.data_device)
         self.big_pose_world_bound = torch.tensor(big_pose_world_bound).to(self.data_device)
-
+    def get_calib_matrix_nerf(self):
+        focal = fov2focal(self.FoVx, self.image_width)  # original focal length
+        intrinsic_matrix = torch.tensor([[focal, 0, self.image_width / 2], [0, focal, self.image_height / 2], [0, 0, 1]]).float()
+        extrinsic_matrix = self.world_view_transform.transpose(0,1).contiguous() # cam2world
+        return intrinsic_matrix, extrinsic_matrix
 class MiniCam:
     def __init__(self, width, height, fovy, fovx, znear, zfar, world_view_transform, full_proj_transform):
         self.image_width = width

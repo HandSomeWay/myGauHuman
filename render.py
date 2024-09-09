@@ -102,6 +102,8 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
     render_pbr_path = os.path.join(model_path, name, "ours_{}".format(iteration), "render_pbr")
     render_diffuse_path = os.path.join(model_path, name, "ours_{}".format(iteration), "render_diffuse")
     render_specular_path = os.path.join(model_path, name, "ours_{}".format(iteration), "render_specular")
+    render_depth_path = os.path.join(model_path, name, "ours_{}".format(iteration), "render_depth")
+    render_ao_path = os.path.join(model_path, name, "ours_{}".format(iteration), "render_ao")
 
     makedirs(render_path, exist_ok=True)
     makedirs(gts_path, exist_ok=True)
@@ -113,18 +115,21 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
     makedirs(render_pbr_path, exist_ok=True)
     makedirs(render_diffuse_path, exist_ok=True)
     makedirs(render_specular_path, exist_ok=True)
+    makedirs(render_depth_path, exist_ok=True)
+    makedirs(render_ao_path, exist_ok=True)
 
     cubemap = CubemapLight(base_res=256).cuda()
 
-    # hdri = read_hdr("/home/shangwei/data/Environment_Maps/high_res_envmaps_2k/bridge.hdr")
-    # hdri = torch.from_numpy(hdri).cuda()
-    # cubemap.base.data = latlong_to_cubemap(hdri, [256, 256])
-    # cubemap.eval()
-    cubemap_path = model_path + f'/env_map{iteration}.pth'
-    checkpoint = torch.load(cubemap_path)
-    cubemap_params = checkpoint["cubemap"]
-    cubemap.load_state_dict(cubemap_params)
+    hdri = read_hdr("/home/shangwei/data/my_HDR_map/blaubeuren_night_2k.hdr")
+    hdri = torch.from_numpy(hdri).cuda()
+    cubemap.base.data = latlong_to_cubemap(hdri, [256, 256])
+    cubemap.eval()
+    # cubemap_path = model_path + f'/env_map{iteration}.pth'
+    # checkpoint = torch.load(cubemap_path)
+    # cubemap_params = checkpoint["cubemap"]
+    # cubemap.load_state_dict(cubemap_params)
     cubemap.build_mips()
+    
     envmap = cubemap.export_envmap(return_img=True).permute(2, 0, 1).clamp(min=0.0, max=1.0)
     envmap_path = os.path.join(model_path, name, "ours_{}".format(iteration), "envmap.png")
     torchvision.utils.save_image(envmap, envmap_path)
@@ -143,6 +148,8 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
     pbr_rd = []
     pbr_diffuse = []
     pbr_specular = []
+    depth_rd = []
+    ao_rd = []
     elapsed_time = 0
 
     for _, view in enumerate(tqdm(views, desc="Rendering progress")):
@@ -161,7 +168,8 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
         render_albedo = render_output["albedo"]
         render_roughness = render_output["roughness"]
         render_metallic = render_output["metallic"]
-
+        render_depth = render_output["render_depth"]
+        normal_ref = render_output["normal_ref"]
         if iteration > 3000 :
             alpha = render_output["render_alpha"]
             H, W = view.image_height, view.image_width
@@ -174,7 +182,11 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
                 .sum(dim=-1)
                 .reshape(H, W, 3)
             )  # [H, W, 3]
-            occlusion = torch.ones_like(render_roughness).permute(1, 2, 0)  # [H, W, 1]
+            import AOrender
+            occlusion = 1 - AOrender.SSAO(render_depth.repeat(3, 1, 1), render_normal).squeeze(0).permute(1, 2, 0)  # [H，W, 1]
+            # occlusion = torch.ones_like(render_roughness).permute(1, 2, 0)  # [H, W, 1]
+            # occlusion = render_output["occlusion"][0, ...].unsqueeze(0).permute(1, 2, 0)
+            # occlusion = render_output["occ"].permute(1, 2 ,0)
             irradiance = torch.zeros_like(render_roughness).permute(1, 2, 0)  # [H, W, 1]
             brdf_lut = get_brdf_lut().cuda()
             pbr_result = pbr_shading(
@@ -187,19 +199,22 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
                 metallic=render_metallic[0, ...].unsqueeze(0).permute(1, 2, 0) if (render_metallic is not None) else None,  # [H, W, 1]
                 tone=False,
                 gamma=False,
-                occlusion=occlusion,
+                occlusion=occlusion,    # [H, W, 1]
                 irradiance=irradiance,
                 brdf_lut=brdf_lut,
             )
             render_pbr = pbr_result["render_rgb"].clamp(min=0.0, max=1.0).permute(2, 0, 1) # [3, H, W]
             render_diffuse = pbr_result["diffuse_rgb"].clamp(min=0.0, max=1.0).permute(2, 0, 1) # [3, H, W]
-            render_specular = pbr_result["diffuse_light"].clamp(min=0.0, max=1.0).permute(2, 0, 1) # [3, H, W]
+            render_specular = pbr_result["specular_rgb"].clamp(min=0.0, max=1.0).permute(2, 0, 1) # [3, H, W]
+            render_ao = occlusion.clamp(min=0.0, max=1.0).permute(2, 0, 1) # [1, H, W]
             render_pbr.permute(1,2,0)[bound_mask[0]==0] = 0 if background.sum().item() == 0 else 1
             render_diffuse.permute(1,2,0)[bound_mask[0]==0] = 0 if background.sum().item() == 0 else 1
             render_specular.permute(1,2,0)[bound_mask[0]==0] = 0 if background.sum().item() == 0 else 1
+            render_ao.permute(1,2,0)[bound_mask[0]==0] = 0 if background.sum().item() == 0 else 1
             pbr_rd.append(render_pbr)
             pbr_diffuse.append(render_diffuse)
             pbr_specular.append(render_specular)
+            ao_rd.append(render_ao)
 
         # end time
         end_time = time.time()
@@ -211,14 +226,17 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
         render_albedo.permute(1,2,0)[bound_mask[0]==0] = 0 if background.sum().item() == 0 else 1
         render_roughness.permute(1,2,0)[bound_mask[0]==0] = 0 if background.sum().item() == 0 else 1
         render_metallic.permute(1,2,0)[bound_mask[0]==0] = 0 if background.sum().item() == 0 else 1
+        render_depth.permute(1,2,0)[bound_mask[0]==0] = 0 if background.sum().item() == 0 else 1
 
         rgbs.append(rendering)
         rgbs_gt.append(gt)
-        rgbs_normal.append(normal)
+        # rgbs_normal.append(normal)
+        rgbs_normal.append(normal_ref)
         rgbs_normal_rd.append(render_normal)
         albedo_rd.append(render_albedo)
         roughness_rd.append(render_roughness)
         metallic_rd.append(render_metallic)
+        depth_rd.append(render_depth)
 
 
     # Calculate elapsed time
@@ -236,9 +254,8 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
         render_albedo = albedo_rd[id]
         render_roughness = roughness_rd[id]
         render_metallic = metallic_rd[id]
-        render_pbr = pbr_rd[id]
-        render_diffuse = pbr_diffuse[id]
-        render_specular = pbr_specular[id]
+        render_depth = depth_rd[id]
+
 
         rendering = torch.clamp(rendering, 0.0, 1.0)
         gt = torch.clamp(gt, 0.0, 1.0)
@@ -247,9 +264,8 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
         render_albedo = torch.clamp(render_albedo, 0.0, 1.0)
         render_roughness = torch.clamp(render_roughness, 0.0, 1.0)
         render_metallic = torch.clamp(render_metallic, 0.0, 1.0)
-        render_pbr = torch.clamp(render_pbr, 0.0, 1.0)
-        render_diffuse = torch.clamp(render_diffuse, 0.0, 1.0)
-        render_specular = torch.clamp(render_specular, 0.0, 1.0)
+        render_depth = torch.clamp(render_depth, 0.0, 1.0)
+
         torchvision.utils.save_image(rendering, os.path.join(render_path, '{0:05d}'.format(id) + ".png"))
         torchvision.utils.save_image(gt, os.path.join(gts_path, '{0:05d}'.format(id) + ".png"))
         torchvision.utils.save_image(normal, os.path.join(normal_path, '{0:05d}'.format(id) + ".png"))
@@ -257,14 +273,29 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
         torchvision.utils.save_image(render_albedo, os.path.join(render_albedo_path, '{0:05d}'.format(id) + ".png"))
         torchvision.utils.save_image(render_roughness, os.path.join(render_roughness_path, '{0:05d}'.format(id) + ".png"))
         torchvision.utils.save_image(render_metallic, os.path.join(render_metallic_path, '{0:05d}'.format(id) + ".png"))
-        torchvision.utils.save_image(render_pbr, os.path.join(render_pbr_path, '{0:05d}'.format(id) + ".png"))
-        torchvision.utils.save_image(render_diffuse, os.path.join(render_diffuse_path, '{0:05d}'.format(id) + ".png"))
-        torchvision.utils.save_image(render_specular, os.path.join(render_specular_path, '{0:05d}'.format(id) + ".png"))
-
+        torchvision.utils.save_image(render_depth, os.path.join(render_depth_path, '{0:05d}'.format(id) + ".png"))
+        if iteration > 3000 :
+            render_pbr = pbr_rd[id]
+            render_diffuse = pbr_diffuse[id]
+            render_specular = pbr_specular[id]
+            render_ao = ao_rd[id]
+            render_pbr = torch.clamp(render_pbr, 0.0, 1.0)
+            render_diffuse = torch.clamp(render_diffuse, 0.0, 1.0)
+            render_specular = torch.clamp(render_specular, 0.0, 1.0)
+            render_ao = torch.clamp(render_ao, 0.0, 1.0)
+            torchvision.utils.save_image(render_pbr, os.path.join(render_pbr_path, '{0:05d}'.format(id) + ".png"))
+            torchvision.utils.save_image(render_diffuse, os.path.join(render_diffuse_path, '{0:05d}'.format(id) + ".png"))
+            torchvision.utils.save_image(render_specular, os.path.join(render_specular_path, '{0:05d}'.format(id) + ".png"))
+            torchvision.utils.save_image(render_ao, os.path.join(render_ao_path, '{0:05d}'.format(id) + ".png"))
         # metrics
-        psnrs += psnr(rendering, gt).mean().double()
-        ssims += ssim(rendering, gt).mean().double()
-        lpipss += loss_fn_vgg(rendering, gt).mean().double()
+        if iteration > 3000 :
+            psnrs += psnr(render_pbr, gt).mean().double()
+            ssims += ssim(render_pbr, gt).mean().double()
+            lpipss += loss_fn_vgg(render_pbr, gt).mean().double()
+        else:
+            psnrs += psnr(rendering, gt).mean().double()
+            ssims += ssim(rendering, gt).mean().double()
+            lpipss += loss_fn_vgg(rendering, gt).mean().double()
 
     psnrs /= len(views)   
     ssims /= len(views)
