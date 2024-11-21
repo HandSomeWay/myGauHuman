@@ -17,6 +17,24 @@ from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianR
 from scene.gaussian_model import GaussianModel
 from utils.sh_utils import eval_sh
 from utils.graphics_utils import normal_from_depth_image
+import cv2
+from baking import bake_set
+
+def project(means3D, H=512, W=512):
+    image = np.zeros((H, W, 3), dtype=np.uint8)
+    p = means3D
+    p[:, 0] -= means3D[:, 0].min()
+    p[:, 1] -= means3D[:, 1].min()
+    x_coords = (p[:, 0] / p[:, 0].max()) * W
+    y_coords = (p[:, 1] / p[:, 1].max()) * H
+    x_coords_np = x_coords.cpu().numpy().astype(np.int32)
+    y_coords_np = y_coords.cpu().numpy().astype(np.int32)
+    # 将点绘制到图像上
+    for x, y in zip(x_coords_np, y_coords_np):
+        cv2.circle(image, (x, y), 2, (0, 255, 0), -1)  # 绘制绿色点
+    # 保存图像
+    cv2.imwrite('point_cloud_projection.png', image)
+
 
 def render_normal(viewpoint_cam, depth, bg_color, alpha):
     # depth: (H, W), bg_color: (3), alpha: (H, W)
@@ -30,7 +48,8 @@ def render_normal(viewpoint_cam, depth, bg_color, alpha):
     normal_ref = normal_ref.squeeze(0).permute(2,0,1)
     return normal_ref
 
-def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, override_color = None, return_smpl_rot=False, transforms=None, translation=None):
+
+def render(iteration, viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, override_color = None, return_smpl_rot=False, transforms=None, translation=None, envmap=None):
     """
     Render the scene. 
     
@@ -69,6 +88,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     rasterizer = GaussianRasterizer(raster_settings=raster_settings)
     means3D = pc.get_xyz
     normal, delta_normal = pc.get_normal()
+    normal = normal #+ delta_normal
     if not pc.motion_offset_flag:
         _, means3D, _, transforms, _, world_normal = pc.coarse_deform_c2source(means3D[None], viewpoint_camera.smpl_param,
             viewpoint_camera.big_pose_smpl_param,
@@ -91,27 +111,42 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         else:
             correct_Rs = None
             means3D = torch.matmul(transforms, means3D[..., None]).squeeze(-1) + translation
+            # world_normal = torch.matmul(transforms, (normal + delta_normal)[..., None]).squeeze(-1)
             world_normal = torch.matmul(transforms, normal[..., None]).squeeze(-1)
 
     means3D = means3D.squeeze()
+    # project(means3D=means3D)
     means2D = screenspace_points
     opacity = pc.get_opacity
     albedo = pc.get_albedo
     roughness = pc.get_roughness
     metallic = pc.get_metallic
-    occlusion = pc.get_occlusion
+    # metallic = 1 - roughness
+    _occlusion = pc.get_roughness.repeat(1,3)
     assert albedo.shape[0] == roughness.shape[0] and albedo.shape[0] == metallic.shape[0]
-
+    
     viewmatrix = viewpoint_camera.world_view_transform
 
     world_normal = world_normal.squeeze()
-    # normal = world_normal
-
-
-    # normal = pc.get_normal(dir_pp_normalized, transforms)  
+    # _occlusion = bake_set(viewpoint_camera, pc, means3D, world_normal, H=256, W=512, light_map=envmap)
+    if iteration > 5000 :
+        if viewpoint_camera.occlusion is None:
+            occlusion = bake_set(viewpoint_camera, pc, means3D, world_normal, H=16, W=32)
+            
+        else:
+            occlusion = viewpoint_camera.occlusion.detach()
+        if envmap is not None:
+            # _occlusion = (occlusion * envmap.permute(1, 2, 0)).sum(dim=(1, 2, 3))[:, None]
+            occ = (torch.clamp(occlusion, min=0, max=1) * envmap.permute(1, 2, 0))
+            _occlusion = (occ.sum(dim=(1, 2))).float().repeat(1, 3)
+            # _occlusion = (occ.max(dim=1)[0]).max(dim=1)[0]
+            # _occlusion = (torch.nn.functional.adaptive_max_pool2d(occ.squeeze(-1), ( 1, 1)).squeeze(-1))
+        else:
+            _occlusion = occlusion.sum(dim=(1, 2))
     normal = transformVector3x3(world_normal, viewmatrix)
+    normal[:,1] = -normal[:,1]  # regularize normal_space to gt_normal_space
     normal = (normal * 0.5) + 0.5
-    # normal = normal[:, [2, 0, 1]]
+    world_normal = (world_normal * 0.5) + 0.5
 
     # If precomputed 3d covariance is provided, use it. If not, then it will be computed from
     # scaling / rotation by the rasterizer.
@@ -137,7 +172,6 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
             sh2rgb = eval_sh(pc.active_sh_degree, shs_view, dir_pp_normalized)
             colors_precomp = torch.clamp_min(sh2rgb + 0.5, 0.0)
             
-
         else:
             shs = pc.get_features
     else:
@@ -163,6 +197,16 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         scales = scales,
         rotations = rotations,
         cov3D_precomp = cov3D_precomp)
+
+    rendered_world_normal, *_ = rasterizer(
+        means3D = means3D,
+        means2D = means2D,
+        shs = shs,
+        colors_precomp = world_normal,
+        opacities = opacity,
+        scales = scales,
+        rotations = rotations,
+        cov3D_precomp = cov3D_precomp)
     
     rendered_albedo, *_ = rasterizer(
         means3D = means3D,
@@ -173,6 +217,18 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         scales = scales,
         rotations = rotations,
         cov3D_precomp = cov3D_precomp)
+    
+    rendered_occlusion, *_ = rasterizer(
+        means3D = means3D,
+        means2D = means2D,
+        shs = shs,
+        colors_precomp = _occlusion,
+        # colors_precomp = roughness.repeat(1, 3),
+        opacities = opacity,
+        scales = scales,
+        rotations = rotations,
+        cov3D_precomp = cov3D_precomp)
+    
     rendered_roughness, *_ = rasterizer(
         means3D = means3D,
         means2D = means2D,
@@ -182,6 +238,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         scales = scales,
         rotations = rotations,
         cov3D_precomp = cov3D_precomp)
+    
     rendered_metallic, *_ = rasterizer(
         means3D = means3D,
         means2D = means2D,
@@ -191,23 +248,18 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         scales = scales,
         rotations = rotations,
         cov3D_precomp = cov3D_precomp)
-    rendered_occlusion, *_ = rasterizer(
-        means3D = means3D,
-        means2D = means2D,
-        shs = shs,
-        colors_precomp = occlusion.repeat(1, 3),
-        opacities = opacity,
-        scales = scales,
-        rotations = rotations,
-        cov3D_precomp = cov3D_precomp)
     
-    viewmatrix = viewpoint_camera.world_view_transform
-    normal_ref = render_normal(viewpoint_cam=viewpoint_camera, depth=depth, bg_color=bg_color, alpha=alpha)
-
-    normal_ref = transformVector3x3(normal_ref.permute(1, 2, 0).reshape(H * W, 3), viewmatrix).permute(1, 0).reshape(3, H, W)
-    normal_ref = (normal_ref * 0.5) + 0.5
-    occ = pc.occ_decoder(torch.cat((rendered_normal, depth), dim=0).unsqueeze(0)).squeeze(0)
-    # print(normal_ref.shape)
+    
+    # rendered_diffuse, *_ = rasterizer(
+    #     means3D = means3D,
+    #     means2D = means2D,
+    #     shs = shs,
+    #     colors_precomp = albedo * _occlusion,
+    #     opacities = opacity,
+    #     scales = scales,
+    #     rotations = rotations,
+    #     cov3D_precomp = cov3D_precomp)
+    
     # Those Gaussians that were frustum culled or had a radius of 0 were not visible.
     # They will be excluded from value updates used in the splitting criteria.
     return {"render": rendered_image,
@@ -221,8 +273,9 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
             "correct_Rs": correct_Rs,
             "normal": rendered_normal,
             "albedo": rendered_albedo,
+            "occlusion": rendered_occlusion,
             "roughness":rendered_roughness,
             "metallic":rendered_metallic,
-            "occlusion":rendered_occlusion,
-            "occ":occ,
-            "normal_ref": normal_ref,}
+            "world_normal": rendered_world_normal,
+            # "diffuse": rendered_diffuse,
+            "means3D": means3D}

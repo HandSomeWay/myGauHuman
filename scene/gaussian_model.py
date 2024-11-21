@@ -249,10 +249,10 @@ class GaussianModel:
 
         normals = torch.tensor(np.asarray(pcd.normals)).float().cuda()
         albedo =  np.zeros_like(np.asarray(pcd.points, dtype=np.float32))
-        roughness = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
+        roughness = torch.ones((self.get_xyz.shape[0], 1), device="cuda")
         metallic = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         occlusion = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
-        self._normal =  nn.Parameter(torch.from_numpy(albedo).to(self._xyz.device).requires_grad_(True))
+        self._normal = nn.Parameter(normals.requires_grad_(False))
         self._delta_normal =  nn.Parameter(torch.from_numpy(albedo).to(self._xyz.device).requires_grad_(True))
         self.smpl_normal = nn.Parameter(normals.requires_grad_(False))
         self._albedo = nn.Parameter(torch.from_numpy(albedo).to(self._xyz.device).requires_grad_(True))
@@ -429,7 +429,7 @@ class GaussianModel:
         self._xyz = nn.Parameter(torch.tensor(xyz, dtype=torch.float, device="cuda").requires_grad_(True))
         self._features_dc = nn.Parameter(torch.tensor(features_dc, dtype=torch.float, device="cuda").transpose(1, 2).contiguous().requires_grad_(True))
         self._features_rest = nn.Parameter(torch.tensor(features_extra, dtype=torch.float, device="cuda").transpose(1, 2).contiguous().requires_grad_(True))
-        self._opacity = nn.Parameter(torch.tensor(opacities, dtype=torch.float, device="cuda").requires_grad_(True))
+        self._opacity = nn.Parameter(torch.tensor(opacities, dtype=torch.float, device="cuda").requires_grad_(False))
         self._scaling = nn.Parameter(torch.tensor(scales, dtype=torch.float, device="cuda").requires_grad_(True))
         self._rotation = nn.Parameter(torch.tensor(rots, dtype=torch.float, device="cuda").requires_grad_(True))
 
@@ -774,10 +774,10 @@ class GaussianModel:
         grads = self.xyz_gradient_accum / self.denom
         grads[grads.isnan()] = 0.0
 
-        # self.densify_and_clone(grads, max_grad, extent)
-        # self.densify_and_split(grads, max_grad, extent)
-        self.kl_densify_and_clone(grads, max_grad, extent, kl_threshold)
-        self.kl_densify_and_split(grads, max_grad, extent, kl_threshold)
+        self.densify_and_clone(grads, max_grad, extent)
+        self.densify_and_split(grads, max_grad, extent)
+        # self.kl_densify_and_clone(grads, max_grad, extent, kl_threshold)
+        # self.kl_densify_and_split(grads, max_grad, extent, kl_threshold)
         # self.kl_merge(grads, max_grad, extent, 0.1)
 
         prune_mask = (self.get_opacity < min_opacity).squeeze()
@@ -844,11 +844,6 @@ class GaussianModel:
             bweights = torch.log(bweights + 1e-9) + lbs_weights
             bweights = F.softmax(bweights, dim=-1)
         
-        normal_from_knn = self.smpl_normal[vert_ids3].squeeze(2)
-        nweight = 1 / ((dis3 + 0.0001) ** 2)
-        normal_weighted = (normal_from_knn * nweight.unsqueeze(-1)).sum(dim=2) / nweight.sum(dim=2).unsqueeze(-1) #[1, N, 3, 3]
-        self._normal = normal_weighted.squeeze(0)
-        normals = normal_weighted + self._delta_normal
         ### From Big To T Pose
         big_pose_params = t_params
         A, R, Th, joints = get_transform_params_torch(self.SMPL_NEUTRAL, big_pose_params)
@@ -857,7 +852,6 @@ class GaussianModel:
         query_pts = query_pts - A[..., :3, 3]
         R_inv = torch.inverse(A[..., :3, :3].float())
         query_pts = torch.matmul(R_inv, query_pts[..., None]).squeeze(-1)
-        # normals = torch.matmul(R_inv, normals[..., None]).squeeze(-1)
         normals = torch.matmul(R_inv, normals[..., None]).squeeze(-1)
 
         # transforms from Big To T Pose

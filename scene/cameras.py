@@ -15,8 +15,8 @@ import numpy as np
 from utils.graphics_utils import getWorld2View2, getProjectionMatrix, getProjectionMatrix_refine, fov2focal
 
 class Camera(nn.Module):
-    def __init__(self, colmap_id, pose_id, R, T, K, FoVx, FoVy, image, gt_alpha_mask,
-                 image_name, uid, normal,
+    def __init__(self, colmap_id, pose_id, R, T, K, FoVx, FoVy, image, normal, gt_alpha_mask,
+                 image_name, uid,
                  bkgd_mask=None, bound_mask=None, smpl_param=None, 
                  world_vertex=None, world_bound=None, big_pose_smpl_param=None,
                  big_pose_world_vertex=None, big_pose_world_bound=None,
@@ -35,7 +35,7 @@ class Camera(nn.Module):
         self.image_name = image_name
         self.bkgd_mask = bkgd_mask
         self.bound_mask = bound_mask
-
+        self.occlusion = None
         try:
             self.data_device = torch.device(data_device)
         except Exception as e:
@@ -48,13 +48,12 @@ class Camera(nn.Module):
         self.image_height = self.original_image.shape[1]
 
         self.original_normal = normal.clamp(0.0, 1.0)
-
+        
         if gt_alpha_mask is not None:
             self.original_image *= gt_alpha_mask#.to(self.data_device)
-            self.original_normal *= gt_alpha_mask
         else:
             self.original_image *= torch.ones((1, self.image_height, self.image_width)) #torch.ones((1, self.image_height, self.image_width), device=self.data_device)
-            self.original_normal *= torch.ones((1, self.image_height, self.image_width))
+
             
         self.zfar = 1000 #100.0
         self.znear = 0.001 #0.01
@@ -74,10 +73,13 @@ class Camera(nn.Module):
         self.big_pose_world_vertex = torch.tensor(big_pose_world_vertex).to(self.data_device)
         self.big_pose_world_bound = torch.tensor(big_pose_world_bound).to(self.data_device)
     def get_calib_matrix_nerf(self):
+
         focal = fov2focal(self.FoVx, self.image_width)  # original focal length
         intrinsic_matrix = torch.tensor([[focal, 0, self.image_width / 2], [0, focal, self.image_height / 2], [0, 0, 1]]).float()
         extrinsic_matrix = self.world_view_transform.transpose(0,1).contiguous() # cam2world
         return intrinsic_matrix, extrinsic_matrix
+    def set_occlusion(self, _occlusion):
+        self.occlusion = _occlusion
 class MiniCam:
     def __init__(self, width, height, fovy, fovx, znear, zfar, world_view_transform, full_proj_transform):
         self.image_width = width

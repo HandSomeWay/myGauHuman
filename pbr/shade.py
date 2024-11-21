@@ -112,7 +112,6 @@ def pbr_shading(
     tone: bool = False,
     gamma: bool = False,
     occlusion: Optional[torch.Tensor] = None,  # [H, W, 1]
-    irradiance: Optional[torch.Tensor] = None,  # [H, W, 1]
     metallic: Optional[torch.Tensor] = None,
     brdf_lut: Optional[torch.Tensor] = None,
     background: Optional[torch.Tensor] = None,
@@ -145,7 +144,7 @@ def pbr_shading(
     )  # [1, H, W, 3]
 
     if occlusion is not None:
-        diffuse_light = diffuse_light * occlusion[None] + (1 - occlusion[None]) * irradiance[None]
+        diffuse_light = diffuse_light * occlusion[None]
 
     results["diffuse_light"] = diffuse_light[0]
     diffuse_rgb = diffuse_light * albedo  # [1, H, W, 3]

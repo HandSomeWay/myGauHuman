@@ -56,7 +56,7 @@ class cubemap_mip(torch.autograd.Function):
 
 class CubemapLight(nn.Module):
     # for nvdiffrec
-    LIGHT_MIN_RES = 16
+    LIGHT_MIN_RES = 8
 
     MIN_ROUGHNESS = 0.08
     MAX_ROUGHNESS = 0.5
@@ -66,12 +66,19 @@ class CubemapLight(nn.Module):
         base_res: int = 512,
         scale: float = 0.5,
         bias: float = 0.25,
+        train: bool = False
     ) -> None:
         super(CubemapLight, self).__init__()
         self.mtx = None
-        base = (
-            torch.rand(6, base_res, base_res, 3, dtype=torch.float32, device="cuda") * scale + bias
-        )
+        self.is_train = train
+        if self.is_train:
+            base = (
+                torch.rand(6, base_res, base_res, 1, dtype=torch.float32, device="cuda") * scale + bias
+            )
+        else:
+            base = (
+                torch.rand(6, base_res, base_res, 3, dtype=torch.float32, device="cuda") * scale + bias
+            )
         self.base = nn.Parameter(base)
         self.register_parameter("env_base", self.base)
 
@@ -95,10 +102,13 @@ class CubemapLight(nn.Module):
 
     def build_mips(self, cutoff: float = 0.99) -> None:
         self.specular = [self.base]
+        if self.is_train:
+            self.specular[0] = self.specular[0].repeat(1,1,1,3)
         while self.specular[-1].shape[1] > self.LIGHT_MIN_RES:
             self.specular += [cubemap_mip.apply(self.specular[-1])]
 
         self.diffuse = diffuse_cubemap(self.specular[-1])
+        # self.diffuse = self.specular[1]
 
         for idx in range(len(self.specular) - 1):
             roughness = (idx / (len(self.specular) - 2)) * (
@@ -110,13 +120,13 @@ class CubemapLight(nn.Module):
     def export_envmap(
         self,
         filename: Optional[str] = None,
-        res: List[int] = [512, 1024],
+        res: List[int] = [256, 512],
         return_img: bool = False,
     ) -> Optional[torch.Tensor]:
         # cubemap_to_latlong
         gy, gx = torch.meshgrid(
-            torch.linspace(0.0 + 1.0 / res[0], 1.0 - 1.0 / res[0], res[0], device="cuda"),
-            torch.linspace(-1.0 + 1.0 / res[1], 1.0 - 1.0 / res[1], res[1], device="cuda"),
+            torch.linspace(0.0, 1.0 , res[0], device="cuda"),
+            torch.linspace(-1.0 , 1.0 , res[1], device="cuda"),
             indexing="ij",
         )
 

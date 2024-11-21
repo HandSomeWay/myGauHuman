@@ -42,12 +42,39 @@ from pbr import CubemapLight, get_brdf_lut, pbr_shading
 from gs_ir import recon_occlusion, IrradianceVolumes
 from typing import Dict, List, Optional, Tuple, Union
 import nvdiffrast.torch as dr
+from torchvision.transforms import Grayscale
 
-def zero_one_loss(img):
-    zero_epsilon = 1e-3
-    val = torch.clamp(img, zero_epsilon, 1 - zero_epsilon)
-    loss = torch.mean(torch.log(val) + torch.log(1 - val))
-    return loss
+class GaussianHistogram(torch.nn.Module):
+    def __init__(self, bins, min, max, sigma):
+        super(GaussianHistogram, self).__init__()
+        self.bins = bins
+        self.min = min
+        self.max = max
+        self.sigma = sigma
+        self.delta = float(max - min) / float(bins)
+        self.centers = float(min) + self.delta * (torch.arange(bins, device=torch.device('cuda:0')).float() + 0.5)
+
+    def forward(self, x):
+        x = torch.unsqueeze(x, 0) - torch.unsqueeze(self.centers, 1)
+        x = torch.exp(-0.5*(x/self.sigma)**2) / (self.sigma * np.sqrt(np.pi*2)) * self.delta
+        x = x.sum(dim=1)
+        return x
+    
+def get_entropy_loss(albedo):
+    albedo_pred = albedo.reshape(albedo.shape[1] * albedo.shape[2], 3)
+    # albedo_pred = albedo
+    albedo_entropy = 0
+    for i in range(3):
+        channel = albedo_pred[..., i]
+        hist = GaussianHistogram(8, 0., 1., sigma=torch.var(channel))
+        h = hist(channel)
+        if h.sum() > 1e-6:
+            h = h.div(h.sum()) + 1e-6
+        else:
+            h = torch.ones_like(h).to(h)
+        albedo_entropy += torch.sum(-h*torch.log(h))
+
+    return albedo_entropy
 
 def get_tv_loss(
     gt_image: torch.Tensor,  # [3, H, W]
@@ -111,10 +138,15 @@ def get_masked_tv_loss(
     return tv_loss
 
 
-def get_envmap_dirs(res: List[int] = [512, 1024]) -> torch.Tensor:
+def get_envmap_dirs(res: List[int] = [256, 512]) -> torch.Tensor:
+    # gy, gx = torch.meshgrid(
+    #     torch.linspace(0.0 + 1.0 / res[0], 1.0 - 1.0 / res[0], res[0], device="cuda"),
+    #     torch.linspace(-1.0 + 1.0 / res[1], 1.0 - 1.0 / res[1], res[1], device="cuda"),
+    #     indexing="ij",
+    # )
     gy, gx = torch.meshgrid(
-        torch.linspace(0.0 + 1.0 / res[0], 1.0 - 1.0 / res[0], res[0], device="cuda"),
-        torch.linspace(-1.0 + 1.0 / res[1], 1.0 - 1.0 / res[1], res[1], device="cuda"),
+        torch.linspace(0.0, 1.0, res[0], device="cuda"),
+        torch.linspace(-1.0 , 1.0, res[1], device="cuda"),
         indexing="ij",
     )
 
@@ -136,8 +168,9 @@ def resize_tensorboard_img(
     img = transform(img)  # [C, H', W']
     return img
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from):
+    # torch.autograd.set_detect_anomaly(True)
     first_iter = 0
-    pbr_iteration = 3000
+    pbr_iteration = 5000
     tb_writer = prepare_output_and_logger(dataset)
     gaussians = GaussianModel(dataset.sh_degree, dataset.smpl_type, dataset.motion_offset_flag, dataset.actor_gender)
     scene = Scene(dataset, gaussians)
@@ -156,8 +189,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     # NOTE: prepare for PBR
     brdf_lut = get_brdf_lut().cuda()
     envmap_dirs = get_envmap_dirs()
-    cubemap = CubemapLight(base_res=256).cuda()
+    cubemap = CubemapLight(base_res=32, train=True).cuda()
     cubemap.train()
+
     aabb = torch.tensor([-bound, -bound, -bound, bound, bound, bound]).cuda()
     irradiance_volumes = IrradianceVolumes(aabb=aabb).cuda()
     irradiance_volumes.train()
@@ -176,9 +210,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     ema_loss_for_log = 0.0
     Ll1_loss_for_log = 0.0
     mask_loss_for_log = 0.0
-    # ssim_loss_for_log = 0.0
-    # lpips_loss_for_log = 0.0
-    # normal_loss_for_log = 0.0
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
 
@@ -201,6 +232,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             except Exception as e:
                 network_gui.conn = None
 
+        with torch.no_grad():
+            env_map = cubemap.export_envmap(return_img=True, res = [16, 32]).permute(2, 0, 1).clamp(min=0.0, max=1.0)
+            # grayscale_transforms = Grayscale(num_output_channels=1)
+            # env_map = grayscale_transforms(env_map)
+
         iter_start.record()
 
         gaussians.update_learning_rate(iteration, pbr_iteration)
@@ -214,8 +250,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         # Pick a random Camera
         if not viewpoint_stack:
-            viewpoint_stack = scene.getTrainCameras().copy()
-        viewpoint_cam = viewpoint_stack.pop(randint(0, len(viewpoint_stack)-1))
+            viewpoint_stack = [i for i in range(len(scene.getTrainCameras()))]
+        viewpoint_idx = viewpoint_stack.pop(randint(0, len(viewpoint_stack)-1))
+        viewpoint_cam = scene.getTrainCameras()[viewpoint_idx]
         try:
             c2w = torch.inverse(viewpoint_cam.world_view_transform.T)  # [4, 4]
         except:
@@ -224,14 +261,14 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         # Render
         if (iteration - 1) == debug_from:
             pipe.debug = True
-        render_pkg = render(viewpoint_cam, gaussians, pipe, background)
+        render_pkg = render(iteration, viewpoint_cam, gaussians, pipe, background, envmap=env_map)
         image, alpha, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["render_alpha"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
-        normal_ref = render_pkg["normal_ref"]
         normal = render_pkg["normal"]
+        world_normal = render_pkg["world_normal"]
         albedo = render_pkg["albedo"]
         roughness = render_pkg["roughness"][0, ...].unsqueeze(0)
         metallic = render_pkg["metallic"][0, ...].unsqueeze(0)
-        
+        occlusion = render_pkg["occlusion"][0, ...].unsqueeze(0)
         # formulate roughness
         rmax, rmin = 1.0, 0.04
         roughness = roughness * (rmax - rmin) + rmin
@@ -246,22 +283,25 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
 
         # Loss
-        gt_normal = viewpoint_cam.original_normal.cuda()
         gt_image = viewpoint_cam.original_image.cuda()
+        gt_normal = viewpoint_cam.original_normal.cuda()
         bkgd_mask = viewpoint_cam.bkgd_mask.cuda()
         bound_mask = viewpoint_cam.bound_mask.cuda()
         loss: torch.Tensor
         
         if iteration <= pbr_iteration:
+            
+            scaling = gaussians.get_scaling
+            scale_loss = torch.sum(torch.max(scaling - 0.015, torch.zeros_like(scaling)))
+
+            point_posed = render_pkg['means3D']
+            distance, _ = gaussians.knn_near_2(point_posed[None], point_posed[None])
+            point_std = torch.std(distance[..., 1])
 
             Ll1 = l1_loss(image.permute(1,2,0)[bound_mask[0]==1], gt_image.permute(1,2,0)[bound_mask[0]==1])
             mask_loss = l2_loss(alpha[bound_mask==1], (bkgd_mask[0].unsqueeze(0))[bound_mask==1])
-
-            scaling = gaussians.get_scaling
         
-            scale_loss = torch.sum(torch.max(scaling-0.005, torch.zeros_like(scaling)))
-            # normal_loss = l1_loss(normal.permute(1,2,0)[bound_mask[0]==1], gt_normal.permute(1,2,0)[bound_mask[0]==1])
-            normal_loss = predicted_normal_loss(normal=normal, normal_ref=normal_ref, alpha=bound_mask)
+            normal_loss = l1_loss(normal.permute(1,2,0)[bound_mask[0]==1], gt_normal.permute(1,2,0)[bound_mask[0]==1])
 
             # crop the object region
             x, y, w, h = cv2.boundingRect(bound_mask[0].cpu().numpy().astype(np.uint8))
@@ -270,33 +310,26 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             normal_pred = normal[:, y:y + h, x:x + w].unsqueeze(0)
             normal_gt = gt_normal[:, y:y + h, x:x + w].unsqueeze(0)
             # ssim loss
-            # ssim_loss = ssim(img_pred, img_gt)
-            # ssim_loss = ssim(normal_pred, normal_gt)
+            ssim_loss = ssim(img_pred, img_gt)
+            ssim_loss += ssim(normal_pred, normal_gt)
             # lipis loss
-            # lpips_loss = loss_fn_vgg(img_pred, img_gt).reshape(-1)
-            # lpips_loss = loss_fn_vgg(normal_pred, normal_gt).reshape(-1)
-            zero_one = zero_one_loss(render_pkg["render_alpha"])
+            lpips_loss = loss_fn_vgg(img_pred, img_gt).reshape(-1)
+            lpips_loss += loss_fn_vgg(normal_pred, normal_gt).reshape(-1)
 
-            loss = Ll1 + 0.1 * mask_loss + 0.03 * zero_one + 0.01 * normal_loss +  0 * scale_loss#+ 0.01 * lpips_loss  + 0.01 * (1.0 - ssim_loss)
+
+            loss = Ll1 + 0.1 * mask_loss + 0.01 * normal_loss + 0.01 * lpips_loss + 0.01 * (1.0 - ssim_loss) + 0.00 * scale_loss #+ point_std
+            if tb_writer:
+                tb_writer.add_scalar('train_loss_patches/normal_loss', normal_loss.item(), iteration)
+                tb_writer.add_scalar('train_loss_patches/scale_loss', scale_loss.item(), iteration)
+                tb_writer.add_scalar('train_loss_patches/point_std_loss', point_std.item(), iteration)
         else: # NOTE: PBR
-            import AOrender
-            # occlusion = 1 - AOrender.SSAO(render_pkg["render_depth"].repeat(3, 1, 1), normal).squeeze(0).permute(1, 2, 0)
-            occlusion = 1 - AOrender.SSAO(render_pkg["render_depth"].repeat(3, 1, 1), normal).squeeze(0).permute(1, 2, 0)
-            # from torchvision.utils import save_image
-            # print(render_pkg["render_depth"].max())
-            # save_image(render_pkg["render_depth"].squeeze(0), 'imageD.png')
-            # save_image(normal, 'imageN.png')
-            # save_image((1 - occlusion).permute(2, 0, 1), 'image.png')
-            # exit()
-            # print(occlusion.shape)
-            # occlusion = torch.ones_like(roughness).permute(1, 2, 0)  # [H, W, 1]
-            # occlusion = render_pkg["occlusion"][0, ...].unsqueeze(0).permute(1, 2, 0)
-            # occlusion = render_pkg["occ"].permute(1, 2, 0)
-            irradiance = torch.zeros_like(roughness).permute(1, 2, 0)  # [H, W, 1]
+            
             cubemap.build_mips() # build mip for environment light
+            
+            mask_loss = l2_loss(alpha[bound_mask==1], (bkgd_mask[0].unsqueeze(0))[bound_mask==1])
             pbr_result = pbr_shading(
                 light=cubemap,
-                normals=normal.permute(1, 2, 0).detach(),  # [H, W, 3]
+                normals=world_normal.permute(1, 2, 0).detach(),  # [H, W, 3]
                 view_dirs=view_dirs,
                 mask=alpha.permute(1, 2, 0),  # [H, W, 1]
                 albedo=albedo.permute(1, 2, 0),  # [H, W, 3]
@@ -304,11 +337,13 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 metallic=metallic.permute(1, 2, 0) if (metallic is not None) else None,  # [H, W, 1]
                 tone=False,
                 gamma=False,
-                occlusion=occlusion,
-                irradiance=irradiance,
+                occlusion=occlusion.permute(1, 2, 0),
                 brdf_lut=brdf_lut,
             )
             render_rgb = pbr_result["render_rgb"].permute(2, 0, 1)  # [3, H, W]
+            # render_diffuse = render_pkg["diffuse"]
+            # render_specular = pbr_result["specular_rgb"].permute(2, 0, 1)
+            # render_rgb = render_diffuse + render_specular
             Ll1 = l1_loss(render_rgb.permute(1,2,0)[bound_mask[0]==1], gt_image.permute(1,2,0)[bound_mask[0]==1])
             
             x, y, w, h = cv2.boundingRect(bound_mask[0].cpu().numpy().astype(np.uint8))
@@ -332,10 +367,14 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     pad=1,  # FIXME: 8 for scene
                     step=1,
                 )
-            loss += brdf_tv_loss * 1.0
-            lamb_loss = (1.0 - roughness[alpha > 0]).mean() + metallic[alpha > 0].mean()
+            entropy_loss = get_entropy_loss(albedo)
+            # entropy_loss = get_entropy_loss(gaussians.get_albedo)
+            loss += brdf_tv_loss * 1.0 + 0.0000 * entropy_loss
+            lamb_loss = (1.0 - roughness[alpha > 0]).mean() + metallic[alpha > 0].mean() 
             loss += lamb_loss * 0.001
 
+            if tb_writer:
+                tb_writer.add_scalar('train_loss_patches/entropy_loss', entropy_loss.item(), iteration)
             #### envmap
             # TV smoothness
             envmap = dr.texture(
@@ -369,9 +408,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
             Ll1_loss_for_log = 0.4 * Ll1.item() + 0.6 * Ll1_loss_for_log
             mask_loss_for_log = 0.4 * mask_loss.item() + 0.6 * mask_loss_for_log
-            # ssim_loss_for_log = 0.4 * ssim_loss.item() + 0.6 * ssim_loss_for_log
-            # lpips_loss_for_log = 0.4 * lpips_loss.item() + 0.6 * lpips_loss_for_log
-            # normal_loss_for_log = 0.4 * normal_loss.item() + 0.6 * normal_loss_for_log
+            
             if iteration % 10 == 0:
                 progress_bar.set_postfix({"#pts": gaussians._xyz.shape[0], "Ll1 Loss": f"{Ll1_loss_for_log:.{3}f}", "mask Loss": f"{mask_loss_for_log:.{2}f}"})
                                         #   "ssim": f"{ssim_loss_for_log:.{2}f}", "lpips": f"{lpips_loss_for_log:.{2}f}", "normal":f"{normal_loss_for_log:.{2}f}"})
@@ -380,7 +417,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 progress_bar.close()
 
             # Log and save
-            training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background))
+            training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background),
+                            cubemap, env_map, brdf_lut, view_dirs)
             
             if (iteration in saving_iterations):
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
@@ -425,11 +463,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         
 def prepare_output_and_logger(args):    
     if not args.model_path:
-        # if os.getenv('OAR_JOB_ID'):
-        #     unique_str=os.getenv('OAR_JOB_ID')
-        # else:
-        #     unique_str = str(uuid.uuid4())
-        # args.model_path = os.path.join("./output/", unique_str[0:10])
         args.model_path = os.path.join("./output/", args.exp_name)
 
         
@@ -442,12 +475,16 @@ def prepare_output_and_logger(args):
     # Create Tensorboard writer
     tb_writer = None
     if TENSORBOARD_FOUND:
-        tb_writer = SummaryWriter(args.model_path)
+        from datetime import datetime
+        TIMESTAMP = "{0:%Y-%m-%dT%H-%M-%S/}".format(datetime.now())
+
+        tb_writer = SummaryWriter(os.path.join(args.model_path, "Logs",TIMESTAMP))
     else:
         print("Tensorboard not available: not logging progress")
     return tb_writer
 
-def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs):
+def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs,
+                    cubemap, light_map, brdf_lut, view_dirs):
     if tb_writer:
         tb_writer.add_scalar('train_loss_patches/l1_loss', Ll1.item(), iteration)
         tb_writer.add_scalar('train_loss_patches/total_loss', loss.item(), iteration)
@@ -455,9 +492,7 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
 
     # Report test and samples of training set
     if iteration in testing_iterations:
-        torch.cuda.empty_cache()
-        # validation_configs = ({'name': 'test', 'cameras' : scene.getTestCameras()}, 
-        #                       {'name': 'train', 'cameras' : [scene.getTrainCameras()[idx % len(scene.getTrainCameras())] for idx in range(5, 30, 5)]})
+        
 
         validation_configs = ({'name': 'test', 'cameras' : scene.getTestCameras()}, 
                               {'name': 'train', 'cameras' : scene.getTrainCameras()})
@@ -471,23 +506,56 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
                 ssim_test = 0.0
                 lpips_test = 0.0
                 for idx, viewpoint in enumerate(config['cameras']):
+                    
+                    torch.cuda.empty_cache()
                     smpl_rot[config['name']][viewpoint.pose_id] = {}
-                    render_output = renderFunc(viewpoint, scene.gaussians, *renderArgs, return_smpl_rot=True)
+                    render_output = renderFunc(iteration, viewpoint, scene.gaussians, *renderArgs, return_smpl_rot=True, envmap=light_map)
                     image = torch.clamp(render_output["render"], 0.0, 1.0)
-
+                    normal = torch.clamp(render_output["normal"], 0.0, 1.0)
+                    if iteration> 5000:
+                        pbr_result = pbr_shading(
+                            light=cubemap,
+                            normals=render_output["world_normal"].permute(1, 2, 0).detach(),  # [H, W, 3]
+                            view_dirs=view_dirs,
+                            mask=render_output["render_alpha"].permute(1, 2, 0),  # [H, W, 1]
+                            albedo=render_output["albedo"].permute(1, 2, 0),  # [H, W, 3]
+                            roughness=render_output["roughness"].permute(1, 2, 0)[..., 0].unsqueeze(-1),  # [H, W, 1]
+                            metallic=render_output["metallic"].permute(1, 2, 0)[..., 0].unsqueeze(-1),  # [H, W, 1]
+                            tone=False,
+                            gamma=False,
+                            occlusion=render_output["occlusion"].permute(1, 2, 0)[..., 0].unsqueeze(-1),
+                            brdf_lut=brdf_lut,
+                        )
+                        # render_diffuse = render_output["diffuse"]
+                        render_diffuse = pbr_result["diffuse_rgb"].permute(2, 0, 1)
+                        render_specular = pbr_result["specular_rgb"].permute(2, 0, 1)
+                        # image = render_diffuse + render_specular
+                        image = torch.clamp(pbr_result["render_rgb"], 0.0, 1.0).permute(2, 0, 1)
+                    envmap = cubemap.export_envmap(return_img=True, res = [16, 32]).permute(2, 0, 1).clamp(min=0.0, max=1.0)
                     gt_image = torch.clamp(viewpoint.original_image.to("cuda"), 0.0, 1.0)
                     bound_mask = viewpoint.bound_mask
                     image.permute(1,2,0)[bound_mask[0]==0] = 0 if renderArgs[1].sum().item() == 0 else 1 
+                    normal.permute(1,2,0)[bound_mask[0]==0] = 0 if renderArgs[1].sum().item() == 0 else 1 
                     if tb_writer and (idx < 5):
                         tb_writer.add_images(config['name'] + "_view_{}/render".format(viewpoint.image_name), image[None], global_step=iteration)
+                        tb_writer.add_images("normal/" + config['name'] + "_view_{}".format(viewpoint.image_name), normal[None], global_step=iteration)
+                        tb_writer.add_images("albedo/" + config['name'] + "_view_{}".format(viewpoint.image_name), render_output["albedo"][None], global_step=iteration)
+                        tb_writer.add_images("occlusion/" + config['name'] + "_view_{}".format(viewpoint.image_name), render_output["occlusion"][None], global_step=iteration)
+                        tb_writer.add_images("roughness/" + config['name'] + "_view_{}".format(viewpoint.image_name), render_output["roughness"][None], global_step=iteration)
+                        tb_writer.add_images("metallic/" + config['name'] + "_view_{}".format(viewpoint.image_name), render_output["metallic"][None], global_step=iteration)
+                        if iteration > 5000:
+                            tb_writer.add_images("diffuse/" + config['name'] + "_view_{}".format(viewpoint.image_name), render_diffuse[None], global_step=iteration)
+                            tb_writer.add_images("specular/" + config['name'] + "_view_{}".format(viewpoint.image_name), render_specular[None], global_step=iteration)
+                        if idx < 1:
+                            tb_writer.add_images("envmap_cube/" + config['name'] + "_view_{}".format(viewpoint.image_name), envmap[None], global_step=iteration)
+                            tb_writer.add_images("envmap/" + config['name'] + "_view_{}".format(viewpoint.image_name), light_map[None], global_step=iteration)
                         if iteration == testing_iterations[0]:
                             tb_writer.add_images(config['name'] + "_view_{}/ground_truth".format(viewpoint.image_name), gt_image[None], global_step=iteration)
                     l1_test += l1_loss(image, gt_image).mean().double()
                     psnr_test += psnr(image, gt_image).mean().double()
                     ssim_test += ssim(image, gt_image).mean().double()
                     lpips_test += loss_fn_vgg(image, gt_image).mean().double()
-                    
-
+                
                     smpl_rot[config['name']][viewpoint.pose_id]['transforms'] = render_output['transforms']
                     smpl_rot[config['name']][viewpoint.pose_id]['translation'] = render_output['translation']
 
@@ -523,8 +591,8 @@ if __name__ == "__main__":
     parser.add_argument('--port', type=int, default=6009)
     parser.add_argument('--debug_from', type=int, default=-1)
     parser.add_argument('--detect_anomaly', action='store_true', default=False)
-    parser.add_argument("--test_iterations", nargs="+", type=int, default=[1_200, 2_000, 3_000, 5_000, 7_000, 30_000])
-    parser.add_argument("--save_iterations", nargs="+", type=int, default= [1_200, 2_000, 3_000, 5_000, 7_000, 30_000])
+    parser.add_argument("--test_iterations", nargs="+", type=int, default=[3_000, 5_000, 7_000, 10_000, 15_000, 20_000, 25_000, 30_000])
+    parser.add_argument("--save_iterations", nargs="+", type=int, default= [3_000, 5_000, 7_000, 10_000, 15_000, 20_000, 25_000, 30_000])
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
     parser.add_argument("--start_checkpoint", type=str, default = None)

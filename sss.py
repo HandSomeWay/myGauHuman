@@ -12,103 +12,91 @@ import torch
 import torch.nn.functional as F
 import cv2
 from gs_ir import recon_occlusion, IrradianceVolumes
-
+import OpenEXR
+import imageio
 import torchvision
 import nvdiffrast.torch as dr
-def cube_to_dir(s: int, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-    if s == 0:
-        rx, ry, rz = torch.ones_like(x), -y, -x
-    elif s == 1:
-        rx, ry, rz = -torch.ones_like(x), -y, x
-    elif s == 2:
-        rx, ry, rz = x, torch.ones_like(x), y
-    elif s == 3:
-        rx, ry, rz = x, -torch.ones_like(x), -y
-    elif s == 4:
-        rx, ry, rz = x, -y, torch.ones_like(x)
-    elif s == 5:
-        rx, ry, rz = -x, -y, -torch.ones_like(x)
-    return torch.stack((rx, ry, rz), dim=-1)
-def latlong_to_cubemap(latlong_map: torch.Tensor, res: List[int]) -> torch.Tensor:
-    cubemap = torch.zeros(
-        6, res[0], res[1], latlong_map.shape[-1], dtype=torch.float32, device="cuda"
-    )
-    for s in range(6):
-        gy, gx = torch.meshgrid(
-            torch.linspace(-1.0 + 1.0 / res[0], 1.0 - 1.0 / res[0], res[0], device="cuda"),
-            torch.linspace(-1.0 + 1.0 / res[1], 1.0 - 1.0 / res[1], res[1], device="cuda"),
-            indexing="ij",
-        )
-        v = F.normalize(cube_to_dir(s, gx, gy), p=2, dim=-1)
+import open3d as o3d
+from PIL import Image
+from utils.image_utils import psnr
+from utils.loss_utils import ssim
+import lpips
 
-        tu = torch.atan2(v[..., 0:1], -v[..., 2:3]) / (2 * np.pi) + 0.5
-        tv = torch.acos(torch.clamp(v[..., 1:2], min=-1, max=1)) / np.pi
-        texcoord = torch.cat((tu, tv), dim=-1)
+loss_fn_vgg = lpips.LPIPS(net='vgg').to(torch.device('cuda', torch.cuda.current_device()))
 
-        cubemap[s, ...] = dr.texture(
-            latlong_map[None, ...], texcoord[None, ...], filter_mode="linear"
-        )[0]
-    return cubemap
+psnrs = 0.0
+ssims = 0.0
+lpipss = 0.0
 
-def read_hdr(path: str) -> np.ndarray:
-    """Reads an HDR map from disk.
+for i in range(4):
+    for j in 2,5,8:
+        render_path = '/home/shangwei/codes/myGauHuman/output/mixamo/ch21/test/ours_7000/render_albedo/'+'{0:05d}'.format(i*6*9+j-1)+'.png'
+        # render_path = '/home/shangwei/codes/myGauHuman/output/mixamo/ch21_entropy/test/ours_7000/render_albedo/'+'{0:05d}'.format(i*6*9+j-1)+'.png'
+        gt_path = '/home/shangwei/data/mixamo/ch21/albedo/'+'{0:02d}'.format(j)+'/'+'{0:04d}'.format(i*30)+'.png'
+        print(render_path)
+        print(gt_path)
+        print('ok')
+        render = Image.open(render_path)
+        gt = Image.open(gt_path)
+        transform = torchvision.transforms.Compose([
+            torchvision.transforms.Resize((512, 512)),  # 调整图片大小
+            torchvision.transforms.ToTensor()           # 将图片转换为Tensor
+        ])
+        render = transform(render).cuda()
+        gt = transform(gt).cuda()
 
-    Args:
-        path (str): Path to the .hdr file.
+        psnrs += psnr(render, gt[:3,:,:]).mean().double()
+        ssims += ssim(render, gt[:3,:,:]).mean().double()
+        lpipss += loss_fn_vgg(render, gt[:3,:,:]).mean().double()
+print(psnrs/12)
+print(ssims/12)
+print(lpipss/12)
+# for i in range(4):
+#     for j in 2, 5, 8:
+#         render_path = '/home/shangwei/codes/myGauHuman/output/mixamo/ch21_entropy/test/ours_7000/render_pbr/'+'{0:05d}'.format(i*6*9+j-1)+'.png'
+#         gt_path = '/home/shangwei/data/mixamo/ch21/images/'+'{0:02d}'.format(j)+'/'+'{0:03d}'.format(i*3)+'0.jpg'
+#         # render_path = '/home/shangwei/codes/myGauHuman/output/mixamo/ch38/train/ours_5000/render_albedo/'+'{0:05d}'.format(i)+'.png'
+#         # gt_path = '/home/shangwei/data/mixamo/ch38/albedo/00/'+'{0:04d}'.format(i)+'.png'
+#         # render_path = '/home/shangwei/codes/RelightableAvatar/data/result/material_rec/material_syn_ch21/relighting/frame'+'{0:04d}'.format(i*30)+'_view'+'{0:04d}'.format(j)+'.png'
+#         print(render_path)
+#         print(gt_path)
+#         print('ok')
+#         render = Image.open(render_path)
+#         gt = Image.open(gt_path)
+#         transform = torchvision.transforms.Compose([
+#             torchvision.transforms.Resize((512, 512)),  # 调整图片大小
+#             torchvision.transforms.ToTensor()           # 将图片转换为Tensor
+#         ])
+#         render = transform(render).cuda()
+#         gt = transform(gt).cuda()
 
-    Returns:
-        numpy.ndarray: Loaded (float) HDR map with RGB channels in order.
-    """
-    with open(path, "rb") as h:
-        buffer_ = np.frombuffer(h.read(), np.uint8)
-    bgr = cv2.imdecode(buffer_, cv2.IMREAD_UNCHANGED)
-    rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-    return rgb
+#         psnrs += psnr(render, gt[:3,:,:]).mean().double()
+#         ssims += ssim(render, gt[:3,:,:]).mean().double()
+#         lpipss += loss_fn_vgg(render, gt[:3,:,:]).mean().double()
 
-cubemap = CubemapLight(base_res=256).cuda()
+# print(psnrs/12)
+# print(ssims/12)
+# print(lpipss/12)
+# ply_path = "/home/shangwei/codes/GauHuman/output/zju_mocap_refine/my_377/point_cloud/iteration_3000/point_cloud.ply"
+# ply_data = plyfile.PlyData.read(ply_path)
 
-hdri = read_hdr("/home/shangwei/data/my_HDR_map/blaubeuren_night_2k.hdr")   #[1024, 2048, 3]
-hdri = torch.from_numpy(hdri).cuda()   #[1024, 2048, 3]
-cubemap.base.data = latlong_to_cubemap(hdri, [256, 256])    #[6, 256, 256, 3]
-cubemap.eval()
-envmap = cubemap.export_envmap(return_img=True).permute(2, 0, 1).clamp(min=0.0, max=1.0)    #[3, 512, 1024]
+# vertex_data = ply_data['vertex'].data
+# vertices_1 = np.array([list(item) for item in vertex_data])
 
-envmap_path = os.path.join("envmap.png")
-torchvision.utils.save_image(envmap, envmap_path)
+# smpl_model = SMPL(sex='neutral', model_dir='assets/SMPL_NEUTRAL_renderpeople.pkl')
+# # 提取顶点、面和法线信息
+# vertices = smpl_model.v_template
+# faces = smpl_model.faces
 
-cubemap.build_mips()
-brdf_lut = get_brdf_lut().cuda()    #[1, 256, 256, 2]
-pbr_result = pbr_shading(
-    light=cubemap,
-    normals=torch.randn(512, 512, 3).cuda(),  # [H, W, 3]
-    view_dirs=torch.randn(512, 512, 3).cuda(),
-    mask=torch.randn(512, 512, 1).cuda(),  # [H, W, 1]
-    albedo=torch.randn(512, 512, 3).cuda(),  # [H, W, 3]
-    roughness=torch.randn(512, 512, 1).cuda(),  # [H, W, 1]
-    metallic=torch.randn(512, 512, 1).cuda(),  # [H, W, 1]
-    tone=False,
-    gamma=False,
-    occlusion=torch.randn(512, 512, 1).cuda(),    # [H, W, 1]
-    irradiance=torch.randn(512, 512, 1).cuda(),
-    brdf_lut=brdf_lut,
-)
-smpl_model = SMPL(sex='neutral', model_dir='assets/SMPL_NEUTRAL_renderpeople.pkl')
-smpl_pose = smpl_model(pose=np.random.rand(smpl_model.pose.size) * .2, beta=np.random.rand(smpl_model.beta.size) * .03)
-# 提取顶点、面和法线信息
-vertices = smpl_pose[0]
-faces = smpl_model.faces
-
-# 创建trimesh对象
-mesh = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
+# # 创建trimesh对象
+# mesh = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
+# upsampled_mesh = mesh.subdivide()
 
 
-# 如果你需要将法线保存为图像，你可以使用以下代码
-# 首先计算每个顶点的法线
-vertex_normals = mesh.vertex_normals
-normal_colors = (vertex_normals + 1.0) / 2.0
-normal_image = (normal_colors * 255).astype(np.uint8)
-
-
-# 输出mesh
+# mesh_1 = trimesh.Trimesh(vertices=vertices_1[...,:3], faces=upsampled_mesh.faces, process=False)
+# trimesh.smoothing.filter_humphrey(mesh_1, alpha=0.1, beta=0.5, iterations=50, laplacian_operator=None)
+# # 输出mesh
 # trimesh会自动计算mesh的法线
-mesh.export('smpl_mesh.ply')
+# mesh.export('smpl_mesh.ply')
+# upsampled_mesh.export('smpl_mesh_upsampled.ply')
+# mesh_1.export('smpl_mesh_trained_smooth.ply')

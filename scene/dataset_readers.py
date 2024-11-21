@@ -56,6 +56,7 @@ class CameraInfo(NamedTuple):
     big_pose_world_vertex: np.array
     big_pose_world_bound: np.array
     smpl_normal: np.array
+    
 
 class SceneInfo(NamedTuple):
     point_cloud: BasicPointCloud
@@ -602,8 +603,12 @@ def readCamerasZJUMoCapRefine(path, output_view, white_background, image_scaling
     big_pose_max_xyz += 0.05
     big_pose_world_bound = np.stack([big_pose_min_xyz, big_pose_max_xyz], axis=0)
 
-    mesh = trimesh.Trimesh(vertices=smpl_model.v_template, faces=smpl_model.faces, process=False)
+    mesh = trimesh.Trimesh(vertices=big_pose_xyz, faces=smpl_model.faces, process=False)
+    # mesh_upsampled = mesh.subdivide()
+    # world_space_normal = mesh_upsampled.vertex_normals
+    # vertices_upsampled = mesh_upsampled.vertices
     world_space_normal = mesh.vertex_normals
+    vertices_upsampled = mesh.vertices
     idx = 0
     for pose_index in range(pose_num):
         for view_index in range(len(output_view)):
@@ -621,10 +626,6 @@ def readCamerasZJUMoCapRefine(path, output_view, white_background, image_scaling
             msk = imageio.imread(msk_path)
             msk = (msk != 0).astype(np.uint8)
 
-            # Load normal
-            normal_path = image_path.replace('images', 'normal')
-            normal = np.array(imageio.imread(normal_path).astype(np.float32)/255.)
-
             if not novel_view_vis:
                 cam_ind = cam_inds[pose_index][view_index]
                 K = np.array(cams['K'][cam_ind])
@@ -634,7 +635,6 @@ def readCamerasZJUMoCapRefine(path, output_view, white_background, image_scaling
 
                 image = cv2.undistort(image, K, D)
                 msk = cv2.undistort(msk, K, D)
-                normal = cv2.undistort(normal, K, D)
             else:
                 pose = np.matmul(np.array([[1,0,0,0], [0,-1,0,0], [0,0,-1,0], [0,0,0,1]]), get_camera_extrinsics_zju_mocap_refine(view_index_look_at, val=True))
                 R = pose[:3,:3]
@@ -643,7 +643,6 @@ def readCamerasZJUMoCapRefine(path, output_view, white_background, image_scaling
                 K = np.array(cams['K'][cam_ind])
 
             image[msk == 0] = 1 if white_background else 0
-            normal[msk == 0] = 1 if white_background else 0
 
             # change from OpenGL/Blender camera axes (Y up, Z back) to COLMAP (Y down, Z forward)
             w2c = np.eye(4)
@@ -660,11 +659,9 @@ def readCamerasZJUMoCapRefine(path, output_view, white_background, image_scaling
                 H, W = int(image.shape[0] * ratio), int(image.shape[1] * ratio)
                 image = cv2.resize(image, (W, H), interpolation=cv2.INTER_AREA)
                 msk = cv2.resize(msk, (W, H), interpolation=cv2.INTER_NEAREST)
-                normal = cv2.resize(normal, (W, H), interpolation=cv2.INTER_AREA)
                 K[:2] = K[:2] * ratio
 
             image = Image.fromarray(np.array(image*255.0, dtype=np.byte), "RGB")
-            normal = Image.fromarray(np.array(normal*255.0, dtype=np.byte), "RGB")
 
             focalX = K[0,0]
             focalY = K[1,1]
@@ -698,7 +695,7 @@ def readCamerasZJUMoCapRefine(path, output_view, white_background, image_scaling
             bkgd_mask = Image.fromarray(np.array(msk*255.0, dtype=np.byte))
 
             cam_infos.append(CameraInfo(uid=idx, pose_id=pose_index, R=R, T=T, K=K, FovY=FovY, FovX=FovX, image=image,
-                            image_path=image_path, image_name=image_name, bkgd_mask=bkgd_mask, normal=normal,
+                            image_path=image_path, image_name=image_name, bkgd_mask=bkgd_mask, 
                             bound_mask=bound_mask, width=image.size[0], height=image.size[1], 
                             smpl_param=smpl_param, world_vertex=xyz, world_bound=world_bound, 
                             big_pose_smpl_param=big_pose_smpl_param, big_pose_world_vertex=big_pose_xyz, 
@@ -731,10 +728,11 @@ def readZJUMoCapRefineInfo(path, white_background, output_path, eval):
     if not os.path.exists(ply_path):
         # Since this data set has no colmap data, we start with random points
         num_pts = 6890 #100_000
+        # num_pts = 27554 #100_000
         print(f"Generating random point cloud ({num_pts})...")
         
         # We create random points inside the bounds of the synthetic Blender scenes
-        xyz = train_cam_infos[0].big_pose_world_vertex
+        xyz = train_cam_infos[0].vertex_upsampled
         normal = train_cam_infos[0].smpl_normal
         shs = np.random.random((num_pts, 3)) / 255.0
         pcd = BasicPointCloud(points=xyz, colors=SH2RGB(shs), normals=normal)
@@ -790,12 +788,12 @@ def readCamerasRender(path, output_view, white_background, image_scaling=0.5, sp
 
     pose_start = 0
     if split == 'train':
-        pose_interval = 1
-        pose_num = 200
+        pose_interval = 2
+        pose_num = 50
     elif split == 'test':
         pose_start = 0
-        pose_interval = 15
-        pose_num = 17
+        pose_interval = 5
+        pose_num = 20
 
     ann_file = os.path.join(path, 'annots.npy')
     annots = np.load(ann_file, allow_pickle=True).item()
@@ -849,12 +847,15 @@ def readCamerasRender(path, output_view, white_background, image_scaling=0.5, sp
                 view_index_look_at = view_index
                 view_index = 0
 
-            # Load image, mask, K, D, R, T
+            # Load image, normal, mask, K, D, R, T
             image_path = os.path.join(path, ims[pose_index][view_index].replace('\\', '/'))
             image_name = ims[pose_index][view_index].split('.')[0]
             image = np.array(imageio.imread(image_path).astype(np.float32)/255.)
 
-            msk_path = image_path.replace('raw_images', 'mask')
+            normal_path = image_path.replace('images', 'normal')
+            normal = np.array(imageio.imread(normal_path).astype(np.float32)/255.)
+
+            msk_path = image_path.replace('images', 'mask').replace('jpg', 'png')
             msk = imageio.imread(msk_path)
             msk = (msk != 0).astype(np.uint8)
 
@@ -866,6 +867,7 @@ def readCamerasRender(path, output_view, white_background, image_scaling=0.5, sp
                 T = np.array(cams['T'][cam_ind]) / 1000.
 
                 image = cv2.undistort(image, K, D)
+                normal = cv2.undistort(normal, K, D)
                 msk = cv2.undistort(msk, K, D)
             else:
                 pose = np.matmul(np.array([[1,0,0,0], [0,-1,0,0], [0,0,-1,0], [0,0,0,1]]), get_camera_extrinsics_render(view_index_look_at, val=True))
@@ -875,6 +877,7 @@ def readCamerasRender(path, output_view, white_background, image_scaling=0.5, sp
                 K = np.array(cams['K'][cam_ind])
 
             image[msk == 0] = 1 if white_background else 0
+            # normal[msk == 0] = 1 if white_background else 0
 
             # change from OpenGL/Blender camera axes (Y up, Z back) to COLMAP (Y down, Z forward)
             w2c = np.eye(4)
@@ -890,10 +893,12 @@ def readCamerasRender(path, output_view, white_background, image_scaling=0.5, sp
             if ratio != 1.:
                 H, W = int(image.shape[0] * ratio), int(image.shape[1] * ratio)
                 image = cv2.resize(image, (W, H), interpolation=cv2.INTER_AREA)
+                normal = cv2.resize(normal, (W, H), interpolation=cv2.INTER_AREA)
                 msk = cv2.resize(msk, (W, H), interpolation=cv2.INTER_NEAREST)
                 K[:2] = K[:2] * ratio
 
             image = Image.fromarray(np.array(image*255.0, dtype=np.byte), "RGB")
+            normal = Image.fromarray(np.array(normal*255.0, dtype=np.byte), "RGB")
 
             focalX = K[0,0]
             focalY = K[1,1]
@@ -927,7 +932,7 @@ def readCamerasRender(path, output_view, white_background, image_scaling=0.5, sp
             bound_mask = Image.fromarray(np.array(bound_mask*255.0, dtype=np.byte))
             bkgd_mask = Image.fromarray(np.array(msk*255.0, dtype=np.uint8))
             
-            cam_infos.append(CameraInfo(uid=idx, pose_id=pose_index, R=R, T=T, K=K, FovY=FovY, FovX=FovX, image=image,normal=image,
+            cam_infos.append(CameraInfo(uid=idx, pose_id=pose_index, R=R, T=T, K=K, FovY=FovY, FovX=FovX, image=image, normal=normal,
                             image_path=image_path, image_name=image_name, bkgd_mask=bkgd_mask, 
                             bound_mask=bound_mask, width=image.size[0], height=image.size[1], 
                             smpl_param=smpl_param, world_vertex=xyz, world_bound=world_bound, 
@@ -939,9 +944,9 @@ def readCamerasRender(path, output_view, white_background, image_scaling=0.5, sp
     return cam_infos
 
 def readRenderInfo(path, white_background, output_path, eval):
-    train_view = [0]
-    test_view = [0]
-    # test_view.remove(train_view[0])
+    train_view = [0, 6]
+    test_view = [i for i in range(0, 10)]
+    test_view.remove(train_view[0])
 
     print("Reading Training Transforms")
     train_cam_infos = readCamerasRender(path, train_view, white_background, split='train')
