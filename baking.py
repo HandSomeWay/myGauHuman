@@ -229,7 +229,7 @@ def bake_set(view, gaussians, means3D, normal, H, W, light_map=None):
 
     with torch.no_grad():
         _occlusion = torch.zeros((opacity.shape[0], H, W, 1), device=opacity.device)
-        dot_map = ((envmap_dirs * normal.unsqueeze(1).unsqueeze(1)).sum(dim=-1, keepdim=True))
+        dot_map = ((envmap_dirs * normal.unsqueeze(1).unsqueeze(1)).sum(dim=-1, keepdim=True)>0)
         # _occlusion = torch.zeros((opacity.shape[0], 1), device=opacity.device)
         for grid_id in range(num_grid):
             grid_mask = (pc_grid_indices == grid_id).int()
@@ -304,7 +304,7 @@ def bake_set(view, gaussians, means3D, normal, H, W, light_map=None):
             # opacity_bool = (1 - opacity_envmap) > 0
             _occlusion += grid_mask_expanded * (1 - opacity_envmap)
             # _occlusion += grid_mask_expanded * opacity_bool
-        occlusion = dot_map/dot_map.max() * _occlusion
+        occlusion = dot_map * _occlusion
         view.set_occlusion(occlusion)
         return occlusion 
 

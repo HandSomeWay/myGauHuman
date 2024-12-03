@@ -19,6 +19,7 @@ from utils.sh_utils import eval_sh
 from utils.graphics_utils import normal_from_depth_image
 import cv2
 from baking import bake_set
+from utils.loss_utils import get_roughness_smooth_loss, get_albedo_smooth_loss, get_kl_loss
 
 def project(means3D, H=512, W=512):
     image = np.zeros((H, W, 3), dtype=np.uint8)
@@ -87,12 +88,12 @@ def render(iteration, viewpoint_camera, pc : GaussianModel, pipe, bg_color : tor
 
     rasterizer = GaussianRasterizer(raster_settings=raster_settings)
     means3D = pc.get_xyz
-    normal, delta_normal = pc.get_normal()
-    normal = normal #+ delta_normal
+    normal = pc.get_normal
+    
     if not pc.motion_offset_flag:
-        _, means3D, _, transforms, _, world_normal = pc.coarse_deform_c2source(means3D[None], viewpoint_camera.smpl_param,
-            viewpoint_camera.big_pose_smpl_param,
-            viewpoint_camera.big_pose_world_vertex[None], normals=normal[None])
+        _, means3D, _, transforms, _, world_normal= pc.coarse_deform_c2source(means3D[None], viewpoint_camera.smpl_param,
+            viewpoint_camera.big_pose_smpl_param, viewpoint_camera.big_pose_world_vertex[None],
+            normals=normal[None])
     else:
         if transforms is None:
             # pose offset
@@ -106,30 +107,49 @@ def render(iteration, viewpoint_camera, pc : GaussianModel, pipe, bg_color : tor
 
             # transform points
             _, means3D, _, transforms, translation, world_normal = pc.coarse_deform_c2source(means3D[None], viewpoint_camera.smpl_param,
-                viewpoint_camera.big_pose_smpl_param,
-                viewpoint_camera.big_pose_world_vertex[None], lbs_weights=lbs_weights, correct_Rs=correct_Rs, return_transl=return_smpl_rot, normals=normal[None])
+                viewpoint_camera.big_pose_smpl_param, viewpoint_camera.big_pose_world_vertex[None], 
+                lbs_weights=lbs_weights, correct_Rs=correct_Rs, return_transl=return_smpl_rot, 
+                normals=normal[None])
         else:
             correct_Rs = None
             means3D = torch.matmul(transforms, means3D[..., None]).squeeze(-1) + translation
             # world_normal = torch.matmul(transforms, (normal + delta_normal)[..., None]).squeeze(-1)
             world_normal = torch.matmul(transforms, normal[..., None]).squeeze(-1)
 
+
     means3D = means3D.squeeze()
-    # project(means3D=means3D)
     means2D = screenspace_points
     opacity = pc.get_opacity
+
+    dir_pp = (means3D - viewpoint_camera.camera_center.repeat(pc.get_features.shape[0], 1))
+    dir_pp_normalized = dir_pp/dir_pp.norm(dim=1, keepdim=True)
+
+    axis = pc.get_minimum_axis(dir_pp_normalized)
+    world_axis = torch.matmul(transforms, axis[..., None]).squeeze(-1)
+
     albedo = pc.get_albedo
     roughness = pc.get_roughness
-    metallic = pc.get_metallic
+    
+    # albedo = pc.get_material['albedo']
+    # roughness = pc.get_material['roughness']
+    # albedo_nn = pc.get_material['albedo_nn']
+    # roughness_nn = pc.get_material['roughness_nn']
+    # smooth_loss = get_albedo_smooth_loss(albedo, albedo_nn) + get_roughness_smooth_loss(roughness, roughness_nn)
+    # kl_loss = get_kl_loss(pc.get_material['brdf_latent'])
+
     # metallic = 1 - roughness
-    _occlusion = pc.get_roughness.repeat(1,3)
-    assert albedo.shape[0] == roughness.shape[0] and albedo.shape[0] == metallic.shape[0]
+    _occlusion = pc.get_opacity.repeat(1,3)
     
     viewmatrix = viewpoint_camera.world_view_transform
 
     world_normal = world_normal.squeeze()
+    world_normal = world_normal/world_normal.norm(dim=1, keepdim=True)
+
+    world_axis = world_axis.squeeze()
+    world_axis = world_axis/world_axis.norm(dim=1, keepdim=True)
+
     # _occlusion = bake_set(viewpoint_camera, pc, means3D, world_normal, H=256, W=512, light_map=envmap)
-    if iteration > 5000 :
+    if iteration > 30000 :
         if viewpoint_camera.occlusion is None:
             occlusion = bake_set(viewpoint_camera, pc, means3D, world_normal, H=16, W=32)
             
@@ -138,7 +158,7 @@ def render(iteration, viewpoint_camera, pc : GaussianModel, pipe, bg_color : tor
         if envmap is not None:
             # _occlusion = (occlusion * envmap.permute(1, 2, 0)).sum(dim=(1, 2, 3))[:, None]
             occ = (torch.clamp(occlusion, min=0, max=1) * envmap.permute(1, 2, 0))
-            _occlusion = (occ.sum(dim=(1, 2))).float().repeat(1, 3)
+            _occlusion = (occ.sum(dim=(1, 2)).repeat(1, 3)).clamp(min=0., max=1.)
             # _occlusion = (occ.max(dim=1)[0]).max(dim=1)[0]
             # _occlusion = (torch.nn.functional.adaptive_max_pool2d(occ.squeeze(-1), ( 1, 1)).squeeze(-1))
         else:
@@ -147,6 +167,10 @@ def render(iteration, viewpoint_camera, pc : GaussianModel, pipe, bg_color : tor
     normal[:,1] = -normal[:,1]  # regularize normal_space to gt_normal_space
     normal = (normal * 0.5) + 0.5
     world_normal = (world_normal * 0.5) + 0.5
+
+    axis = transformVector3x3(world_axis, viewmatrix)
+    axis[:,1] = -axis[:,1]  # regularize normal_space to gt_normal_space
+    axis = (axis * 0.5) + 0.5
 
     # If precomputed 3d covariance is provided, use it. If not, then it will be computed from
     # scaling / rotation by the rasterizer.
@@ -167,8 +191,6 @@ def render(iteration, viewpoint_camera, pc : GaussianModel, pipe, bg_color : tor
     if override_color is None:
         if pipe.convert_SHs_python:
             shs_view = pc.get_features.transpose(1, 2).view(-1, 3, (pc.max_sh_degree+1)**2)
-            dir_pp = (means3D - viewpoint_camera.camera_center.repeat(pc.get_features.shape[0], 1))
-            dir_pp_normalized = dir_pp/dir_pp.norm(dim=1, keepdim=True)
             sh2rgb = eval_sh(pc.active_sh_degree, shs_view, dir_pp_normalized)
             colors_precomp = torch.clamp_min(sh2rgb + 0.5, 0.0)
             
@@ -233,32 +255,23 @@ def render(iteration, viewpoint_camera, pc : GaussianModel, pipe, bg_color : tor
         means3D = means3D,
         means2D = means2D,
         shs = shs,
-        colors_precomp = roughness.repeat(1, 3),
+        colors_precomp = roughness.mean(dim=1)[:,None].repeat(1, 3),
         opacities = opacity,
         scales = scales,
         rotations = rotations,
         cov3D_precomp = cov3D_precomp)
     
-    rendered_metallic, *_ = rasterizer(
+    rendered_axis, *_ = rasterizer(
         means3D = means3D,
         means2D = means2D,
         shs = shs,
-        colors_precomp = metallic.repeat(1, 3),
+        colors_precomp = axis,
         opacities = opacity,
         scales = scales,
         rotations = rotations,
         cov3D_precomp = cov3D_precomp)
+
     
-    
-    # rendered_diffuse, *_ = rasterizer(
-    #     means3D = means3D,
-    #     means2D = means2D,
-    #     shs = shs,
-    #     colors_precomp = albedo * _occlusion,
-    #     opacities = opacity,
-    #     scales = scales,
-    #     rotations = rotations,
-    #     cov3D_precomp = cov3D_precomp)
     
     # Those Gaussians that were frustum culled or had a radius of 0 were not visible.
     # They will be excluded from value updates used in the splitting criteria.
@@ -275,7 +288,8 @@ def render(iteration, viewpoint_camera, pc : GaussianModel, pipe, bg_color : tor
             "albedo": rendered_albedo,
             "occlusion": rendered_occlusion,
             "roughness":rendered_roughness,
-            "metallic":rendered_metallic,
             "world_normal": rendered_world_normal,
-            # "diffuse": rendered_diffuse,
-            "means3D": means3D}
+            "render_axis": rendered_axis,
+            # "smooth_loss": smooth_loss,
+            # "kl_loss": kl_loss
+            }

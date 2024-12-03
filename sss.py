@@ -29,10 +29,12 @@ ssims = 0.0
 lpipss = 0.0
 
 for i in range(4):
-    for j in 2,5,8:
-        render_path = '/home/shangwei/codes/myGauHuman/output/mixamo/ch21/test/ours_7000/render_albedo/'+'{0:05d}'.format(i*6*9+j-1)+'.png'
-        # render_path = '/home/shangwei/codes/myGauHuman/output/mixamo/ch21_entropy/test/ours_7000/render_albedo/'+'{0:05d}'.format(i*6*9+j-1)+'.png'
-        gt_path = '/home/shangwei/data/mixamo/ch21/albedo/'+'{0:02d}'.format(j)+'/'+'{0:04d}'.format(i*30)+'.png'
+    for j in range(4): #0,2,5,8:
+        j_idx = [0, 2, 5, 8]
+        render_path = '/home/shangwei/codes/myGauHuman/output/mixamo/ch21_kl/test/ours_25000/render_albedo/'+'{0:05d}'.format(i*6*4+j)+'.png'
+        # render_path = '/home/shangwei/codes/RelightableAvatar/data/result/material_rec/material_syn_ch21/albedo/frame'+'{0:04d}'.format(i*30)+'_view{0:04d}.png'.format(j_idx[j])
+        
+        gt_path = '/home/shangwei/data/mixamo/ch21/albedo/'+'{0:02d}'.format(j_idx[j])+'/'+'{0:04d}'.format(i*30)+'.png'
         print(render_path)
         print(gt_path)
         print('ok')
@@ -48,16 +50,18 @@ for i in range(4):
         psnrs += psnr(render, gt[:3,:,:]).mean().double()
         ssims += ssim(render, gt[:3,:,:]).mean().double()
         lpipss += loss_fn_vgg(render, gt[:3,:,:]).mean().double()
-print(psnrs/12)
-print(ssims/12)
-print(lpipss/12)
+print(psnrs/16)
+print(ssims/16)
+print(lpipss/16)
 # for i in range(4):
-#     for j in 2, 5, 8:
-#         render_path = '/home/shangwei/codes/myGauHuman/output/mixamo/ch21_entropy/test/ours_7000/render_pbr/'+'{0:05d}'.format(i*6*9+j-1)+'.png'
-#         gt_path = '/home/shangwei/data/mixamo/ch21/images/'+'{0:02d}'.format(j)+'/'+'{0:03d}'.format(i*3)+'0.jpg'
+#     for j in range(4): #2, 5, 8:
+#         # render_path = '/home/shangwei/codes/myGauHuman/output/mixamo/ch21/test/ours_30000/render_pbr/'+'{0:05d}'.format(i*6*4+j)+'.png'
+#         j_idx = [0, 2, 5, 8]
+#         # gt_path = '/home/shangwei/data/mixamo/ch21/images/'+'{0:02d}'.format(j_idx[j])+'/'+'{0:03d}'.format(i*3)+'0.jpg'
+#         gt_path = '/home/shangwei/data/mixamo/ch21/relighting/0003/images/'+'{0:02d}'.format(j_idx[j])+'/'+'{0:04d}'.format(i*3)+'.png'
 #         # render_path = '/home/shangwei/codes/myGauHuman/output/mixamo/ch38/train/ours_5000/render_albedo/'+'{0:05d}'.format(i)+'.png'
 #         # gt_path = '/home/shangwei/data/mixamo/ch38/albedo/00/'+'{0:04d}'.format(i)+'.png'
-#         # render_path = '/home/shangwei/codes/RelightableAvatar/data/result/material_rec/material_syn_ch21/relighting/frame'+'{0:04d}'.format(i*30)+'_view'+'{0:04d}'.format(j)+'.png'
+#         render_path = '/home/shangwei/codes/RelightableAvatar/relighting/ch21/0003/frame'+'{0:04d}'.format(i*30)+'_view{0:04d}.png'.format(j_idx[j])
 #         print(render_path)
 #         print(gt_path)
 #         print('ok')
@@ -74,9 +78,9 @@ print(lpipss/12)
 #         ssims += ssim(render, gt[:3,:,:]).mean().double()
 #         lpipss += loss_fn_vgg(render, gt[:3,:,:]).mean().double()
 
-# print(psnrs/12)
-# print(ssims/12)
-# print(lpipss/12)
+# print(psnrs/16)
+# print(ssims/16)
+# print(lpipss/16)
 # ply_path = "/home/shangwei/codes/GauHuman/output/zju_mocap_refine/my_377/point_cloud/iteration_3000/point_cloud.ply"
 # ply_data = plyfile.PlyData.read(ply_path)
 

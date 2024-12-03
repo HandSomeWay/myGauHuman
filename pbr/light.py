@@ -102,13 +102,12 @@ class CubemapLight(nn.Module):
 
     def build_mips(self, cutoff: float = 0.99) -> None:
         self.specular = [self.base]
-        if self.is_train:
-            self.specular[0] = self.specular[0].repeat(1,1,1,3)
+        
         while self.specular[-1].shape[1] > self.LIGHT_MIN_RES:
             self.specular += [cubemap_mip.apply(self.specular[-1])]
 
-        self.diffuse = diffuse_cubemap(self.specular[-1])
-        # self.diffuse = self.specular[1]
+        self.diffuse = diffuse_cubemap(self.specular[0])
+        # self.diffuse = self.specular[1] / (self.specular[1] + 0.18)
 
         for idx in range(len(self.specular) - 1):
             roughness = (idx / (len(self.specular) - 2)) * (

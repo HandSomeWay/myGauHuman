@@ -555,8 +555,8 @@ def readCamerasZJUMoCapRefine(path, output_view, white_background, image_scaling
 
     pose_start = 0
     if split == 'train':
-        pose_interval = 5
-        pose_num = 100
+        pose_interval = 10
+        pose_num = 50
     elif split == 'test':
         pose_start = 0
         pose_interval = 30
@@ -622,6 +622,9 @@ def readCamerasZJUMoCapRefine(path, output_view, white_background, image_scaling
             image_name = ims[pose_index][view_index].split('.')[0]
             image = np.array(imageio.imread(image_path).astype(np.float32)/255.)
 
+            normal_path = image_path.replace('images', 'normal')
+            normal = np.array(imageio.imread(normal_path).astype(np.float32)/255.)
+
             msk_path = image_path.replace('images', 'mask').replace('jpg', 'png')
             msk = imageio.imread(msk_path)
             msk = (msk != 0).astype(np.uint8)
@@ -634,6 +637,7 @@ def readCamerasZJUMoCapRefine(path, output_view, white_background, image_scaling
                 T = np.array(cams['T'][cam_ind]) / 1000.
 
                 image = cv2.undistort(image, K, D)
+                normal = cv2.undistort(normal, K, D)
                 msk = cv2.undistort(msk, K, D)
             else:
                 pose = np.matmul(np.array([[1,0,0,0], [0,-1,0,0], [0,0,-1,0], [0,0,0,1]]), get_camera_extrinsics_zju_mocap_refine(view_index_look_at, val=True))
@@ -643,6 +647,7 @@ def readCamerasZJUMoCapRefine(path, output_view, white_background, image_scaling
                 K = np.array(cams['K'][cam_ind])
 
             image[msk == 0] = 1 if white_background else 0
+            normal[msk == 0] = 1 if white_background else 0
 
             # change from OpenGL/Blender camera axes (Y up, Z back) to COLMAP (Y down, Z forward)
             w2c = np.eye(4)
@@ -658,10 +663,12 @@ def readCamerasZJUMoCapRefine(path, output_view, white_background, image_scaling
             if ratio != 1.:
                 H, W = int(image.shape[0] * ratio), int(image.shape[1] * ratio)
                 image = cv2.resize(image, (W, H), interpolation=cv2.INTER_AREA)
+                normal = cv2.resize(normal, (W, H), interpolation=cv2.INTER_AREA)
                 msk = cv2.resize(msk, (W, H), interpolation=cv2.INTER_NEAREST)
                 K[:2] = K[:2] * ratio
 
             image = Image.fromarray(np.array(image*255.0, dtype=np.byte), "RGB")
+            normal = Image.fromarray(np.array(normal*255.0, dtype=np.byte), "RGB")
 
             focalX = K[0,0]
             focalY = K[1,1]
@@ -693,8 +700,8 @@ def readCamerasZJUMoCapRefine(path, output_view, white_background, image_scaling
             bound_mask = Image.fromarray(np.array(bound_mask*255.0, dtype=np.byte))
 
             bkgd_mask = Image.fromarray(np.array(msk*255.0, dtype=np.byte))
-
-            cam_infos.append(CameraInfo(uid=idx, pose_id=pose_index, R=R, T=T, K=K, FovY=FovY, FovX=FovX, image=image,
+            
+            cam_infos.append(CameraInfo(uid=idx, pose_id=pose_index, R=R, T=T, K=K, FovY=FovY, FovX=FovX, image=image, normal=normal,
                             image_path=image_path, image_name=image_name, bkgd_mask=bkgd_mask, 
                             bound_mask=bound_mask, width=image.size[0], height=image.size[1], 
                             smpl_param=smpl_param, world_vertex=xyz, world_bound=world_bound, 
@@ -707,9 +714,9 @@ def readCamerasZJUMoCapRefine(path, output_view, white_background, image_scaling
 
 
 def readZJUMoCapRefineInfo(path, white_background, output_path, eval):
-    train_view = [4]
-    test_view = [i for i in range(0, 23)]
-    test_view.remove(train_view[0])
+    train_view = [0, 6, 12, 18]
+    test_view = [3]
+    # test_view.remove(train_view[0])
 
     print("Reading Training Transforms")
     train_cam_infos = readCamerasZJUMoCapRefine(path, train_view, white_background, split='train')
@@ -944,9 +951,9 @@ def readCamerasRender(path, output_view, white_background, image_scaling=0.5, sp
     return cam_infos
 
 def readRenderInfo(path, white_background, output_path, eval):
-    train_view = [0, 6]
-    test_view = [i for i in range(0, 10)]
-    test_view.remove(train_view[0])
+    train_view = [1, 4, 7, 9]
+    test_view = [0, 2, 5, 8]
+    # test_view.remove(train_view[0])
 
     print("Reading Training Transforms")
     train_cam_infos = readCamerasRender(path, train_view, white_background, split='train')

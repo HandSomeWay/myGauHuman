@@ -34,6 +34,8 @@ import numpy as np
 import nvdiffrast.torch as dr
 from torchvision.transforms import Grayscale
 
+from testcopy import SSAO
+
 loss_fn_vgg = lpips.LPIPS(net='vgg').to(torch.device('cuda', torch.cuda.current_device()))
 
 
@@ -102,7 +104,6 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
     world_normal_path = os.path.join(model_path, name, "ours_{}".format(iteration), "world_normal")
     render_albedo_path = os.path.join(model_path, name, "ours_{}".format(iteration), "render_albedo")
     render_roughness_path = os.path.join(model_path, name, "ours_{}".format(iteration), "render_roughness")
-    render_metallic_path = os.path.join(model_path, name, "ours_{}".format(iteration), "render_metallic")
     render_pbr_path = os.path.join(model_path, name, "ours_{}".format(iteration), "render_pbr")
     render_diffuse_path = os.path.join(model_path, name, "ours_{}".format(iteration), "render_diffuse")
     render_specular_path = os.path.join(model_path, name, "ours_{}".format(iteration), "render_specular")
@@ -117,7 +118,6 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
     makedirs(world_normal_path, exist_ok=True)
     makedirs(render_albedo_path, exist_ok=True)
     makedirs(render_roughness_path, exist_ok=True)
-    makedirs(render_metallic_path, exist_ok=True)
     makedirs(render_pbr_path, exist_ok=True)
     makedirs(render_diffuse_path, exist_ok=True)
     makedirs(render_specular_path, exist_ok=True)
@@ -132,29 +132,30 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
     # hdri = torch.from_numpy(hdri).cuda()
 
     # Read EXR file as novel light.
-    os.environ["OPENCV_IO_ENABLE_OPENEXR"] = "1"
-    image = cv2.imread('/home/shangwei/data/mixamo/envmaps/0001.exr', cv2.IMREAD_UNCHANGED)
-    hdri = torch.from_numpy(image).cuda()[:,:,[2,1,0]]
-    ldri = (hdri / (hdri+0.18))
-    # cubemap.base.data = latlong_to_cubemap(ldri[..., :3].contiguous(), [16, 16])
-    cubemap.base.data = latlong_to_cubemap(hdri[..., :3].contiguous(), [32, 32])
+    # os.environ["OPENCV_IO_ENABLE_OPENEXR"] = "1"
+    # image = cv2.imread('/home/shangwei/data/mixamo/envmaps/sunset.exr', cv2.IMREAD_UNCHANGED)
+    # # image = cv2.imread('/home/shangwei/codes/RelightableAvatar/relighting/0000.exr', cv2.IMREAD_UNCHANGED)
+    # # image = np.power(image, 1./2.2)
+    # hdri = torch.from_numpy(image).cuda()[:,:,[2,1,0]]
+    # # cubemap.base.data = latlong_to_cubemap(ldri[..., :3].contiguous(), [32, 32])
+    # cubemap.base.data = latlong_to_cubemap(hdri[..., :3].contiguous(), [32, 32])
 
-    # Regularize the novel light.
-    new_cubemap = torch.zeros_like(cubemap.base)
-    new_cubemap[0] = cubemap.base[5].transpose(0, 1).flip(0)
-    new_cubemap[1] = cubemap.base[4].transpose(0, 1).flip(1)
-    new_cubemap[2] = cubemap.base[1].flip(0).flip(1)
-    new_cubemap[3] = cubemap.base[0]
-    new_cubemap[4] = cubemap.base[2].transpose(0, 1).flip(1)
-    new_cubemap[5] = cubemap.base[3].transpose(0, 1).flip(1)
-    cubemap.base.data = new_cubemap
-    cubemap.eval()
+    # # Regularize the novel light.
+    # new_cubemap = torch.zeros_like(cubemap.base)
+    # new_cubemap[0] = cubemap.base[5].transpose(0, 1).flip(0)
+    # new_cubemap[1] = cubemap.base[4].transpose(0, 1).flip(1)
+    # new_cubemap[2] = cubemap.base[1].flip(0).flip(1)
+    # new_cubemap[3] = cubemap.base[0]
+    # new_cubemap[4] = cubemap.base[2].transpose(0, 1).flip(1)
+    # new_cubemap[5] = cubemap.base[3].transpose(0, 1).flip(1)
+    # cubemap.base.data = new_cubemap
+    # cubemap.eval()
 
-    # # Reconstructed light
-    # cubemap_path = model_path + f'/env_map{iteration}.pth'
-    # checkpoint = torch.load(cubemap_path)
-    # cubemap_params = checkpoint["cubemap"]
-    # cubemap.load_state_dict(cubemap_params)
+    # Reconstructed light
+    cubemap_path = model_path + f'/env_map{iteration}.pth'
+    checkpoint = torch.load(cubemap_path)
+    cubemap_params = checkpoint["cubemap"]
+    cubemap.load_state_dict(cubemap_params)
     
     cubemap.build_mips()
     
@@ -175,7 +176,6 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
     rgbs_normal_wd = []
     albedo_rd = []
     roughness_rd = []
-    metallic_rd = []
     pbr_rd = []
     pbr_diffuse = []
     pbr_specular = []
@@ -183,10 +183,14 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
     alpha_rd = []
     ao_rd = []
     elapsed_time = 0
-
     for _, view in enumerate(tqdm(views, desc="Rendering progress")):
         gt = view.original_image[0:3, :, :].cuda()
         gt_normal = view.original_normal[0:3, :, :].cuda()
+        
+        if 'zju' in model_path:
+            gt_normal = (gt_normal * 2) - 1.
+            gt_normal[2, ...] = -gt_normal[2, ...]
+            gt_normal = (gt_normal + 1) / 2.
         bound_mask = view.bound_mask
         transforms, translation = smpl_rot[name][view.pose_id]['transforms'], smpl_rot[name][view.pose_id]['translation']
 
@@ -200,9 +204,10 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
         world_normal = render_output["world_normal"]
         render_albedo = render_output["albedo"]
         render_roughness = render_output["roughness"]
-        render_metallic = render_output["metallic"]
         render_occlusion = render_output["occlusion"]
         render_depth = render_output["render_depth"]
+
+        # ssao = SSAO(render_depth, render_normal)
         if iteration > 3000 :
             alpha = render_output["render_alpha"]
             H, W = view.image_height, view.image_width
@@ -215,16 +220,18 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
                 .sum(dim=-1)
                 .reshape(H, W, 3)
             )  # [H, W, 3]
+
             brdf_lut = get_brdf_lut().cuda()
             pbr_result = pbr_shading(
                 light=cubemap,
                 normals=world_normal.permute(1, 2, 0).detach(),  # [H, W, 3]
+                # normals=normal.permute(1, 2, 0).detach(),  # [H, W, 3]
                 view_dirs=view_dirs,
                 mask=alpha.permute(1, 2, 0),  # [H, W, 1]
                 albedo=render_albedo.permute(1, 2, 0),  # [H, W, 3]
                 # albedo=albedo.permute(1, 2, 0),  # [H, W, 3]
                 roughness=render_roughness[0, ...].unsqueeze(0).permute(1, 2, 0),  # [H, W, 1]
-                metallic=render_metallic[0, ...].unsqueeze(0).permute(1, 2, 0),  # [H, W, 1]
+                metallic=None,  # [H, W, 1]
                 tone=False,
                 gamma=False,
                 occlusion=render_occlusion.permute(1, 2, 0)[..., 0][..., None],    # [H, W, 1]
@@ -235,7 +242,10 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
             # render_diffuse = render_output['diffuse']
             render_specular = pbr_result["specular_rgb"].clamp(min=0.0, max=1.0).permute(2, 0, 1) # [3, H, W]
             
+
+
             # render_pbr = render_diffuse + render_specular
+
             render_ao = render_occlusion.clamp(min=0.0, max=1.0) # [1, H, W]
             render_pbr.permute(1,2,0)[bound_mask[0]==0] = 0 if background.sum().item() == 0 else 1
             render_diffuse.permute(1,2,0)[bound_mask[0]==0] = 0 if background.sum().item() == 0 else 1
@@ -256,7 +266,6 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
         world_normal.permute(1,2,0)[bound_mask[0]==0] = 0 if background.sum().item() == 0 else 1
         render_albedo.permute(1,2,0)[bound_mask[0]==0] = 0 if background.sum().item() == 0 else 1
         render_roughness.permute(1,2,0)[bound_mask[0]==0] = 0 if background.sum().item() == 0 else 1
-        render_metallic.permute(1,2,0)[bound_mask[0]==0] = 0 if background.sum().item() == 0 else 1
         render_depth.permute(1,2,0)[bound_mask[0]==0] = 0 if background.sum().item() == 0 else 1
         render_alpha.permute(1,2,0)[bound_mask[0]==0] = 0 if background.sum().item() == 0 else 1
 
@@ -268,7 +277,6 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
         rgbs_normal_wd.append(world_normal)
         albedo_rd.append(render_albedo)
         roughness_rd.append(render_roughness)
-        metallic_rd.append(render_metallic)
         depth_rd.append(render_depth)
         alpha_rd.append(render_alpha)
 
@@ -288,7 +296,6 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
         world_normal = rgbs_normal_wd[id]
         render_albedo = albedo_rd[id]
         render_roughness = roughness_rd[id]
-        render_metallic = metallic_rd[id]
         render_depth = depth_rd[id]
         render_alpha = alpha_rd[id]
 
@@ -300,7 +307,6 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
         world_normal = torch.clamp(world_normal, 0.0, 1.0)
         render_albedo = torch.clamp(render_albedo, 0.0, 1.0)
         render_roughness = torch.clamp(render_roughness, 0.0, 1.0)
-        render_metallic = torch.clamp(render_metallic, 0.0, 1.0)
         render_depth = torch.clamp(render_depth, 0.0, 1.0)
         render_alpha = torch.clamp(render_alpha, 0.0, 1.0)
 
@@ -311,7 +317,6 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
         torchvision.utils.save_image(world_normal, os.path.join(world_normal_path, '{0:05d}'.format(id) + ".png"))
         torchvision.utils.save_image(render_albedo, os.path.join(render_albedo_path, '{0:05d}'.format(id) + ".png"))
         torchvision.utils.save_image(render_roughness, os.path.join(render_roughness_path, '{0:05d}'.format(id) + ".png"))
-        torchvision.utils.save_image(render_metallic, os.path.join(render_metallic_path, '{0:05d}'.format(id) + ".png"))
         torchvision.utils.save_image(render_depth, os.path.join(render_depth_path, '{0:05d}'.format(id) + ".png"))
         torchvision.utils.save_image(render_alpha, os.path.join(render_alpha_path, '{0:05d}'.format(id) + ".png"))
         if iteration > 3000 :

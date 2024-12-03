@@ -13,7 +13,7 @@
 import os
 import torch
 from random import randint
-from utils.loss_utils import l1_loss, l2_loss, ssim, predicted_normal_loss, delta_normal_loss
+from utils.loss_utils import l1_loss, l2_loss, ssim, get_roughness_smooth_loss, get_albedo_smooth_loss
 from gaussian_renderer import render, network_gui
 import sys
 from scene import Scene, GaussianModel
@@ -44,96 +44,53 @@ from typing import Dict, List, Optional, Tuple, Union
 import nvdiffrast.torch as dr
 from torchvision.transforms import Grayscale
 
-class GaussianHistogram(torch.nn.Module):
-    def __init__(self, bins, min, max, sigma):
-        super(GaussianHistogram, self).__init__()
-        self.bins = bins
-        self.min = min
-        self.max = max
-        self.sigma = sigma
-        self.delta = float(max - min) / float(bins)
-        self.centers = float(min) + self.delta * (torch.arange(bins, device=torch.device('cuda:0')).float() + 0.5)
+def gaussian_histogram(x: torch.Tensor, bins: int = 15, min: float = 0.0, max: float = 1.0):
+    x = x.view(-1, x.shape[-1])  # N, 3
+    sigma = x.var(dim=0)  # 3,
+    delta = (max - min) / bins
+    centers = min + delta * (torch.arange(bins, device=x.device, dtype=x.dtype) + 0.5)  # BIN
+    x = x[None] - centers[:, None, None]  # BIN, N, 3
+    x = (-0.5 * (x / sigma).pow(2)).exp() / (sigma * np.sqrt(np.pi * 2)) * delta  # BIN, N, 3
+    x = x.sum(dim=1)
+    return x  # BIN, 3
 
-    def forward(self, x):
-        x = torch.unsqueeze(x, 0) - torch.unsqueeze(self.centers, 1)
-        x = torch.exp(-0.5*(x/self.sigma)**2) / (self.sigma * np.sqrt(np.pi*2)) * self.delta
-        x = x.sum(dim=1)
-        return x
-    
-def get_entropy_loss(albedo):
-    albedo_pred = albedo.reshape(albedo.shape[1] * albedo.shape[2], 3)
-    # albedo_pred = albedo
-    albedo_entropy = 0
+def gaussian_entropy(x: torch.Tensor, *args, **kwargs):
+    eps = 1e-6
+    hps = 1e-9
+    h = gaussian_histogram(x, *args, **kwargs)
+    # h = (h / (h.sum(dim=0) + hps)).clip(eps)  # 3,
+    # entropy = (-h * h.log()).sum(dim=0).sum(dim=0)  # per channel entropy summed
+    entropy = 0
     for i in range(3):
-        channel = albedo_pred[..., i]
-        hist = GaussianHistogram(8, 0., 1., sigma=torch.var(channel))
-        h = hist(channel)
-        if h.sum() > 1e-6:
-            h = h.div(h.sum()) + 1e-6
+        hi = h[..., i]
+        if hi.sum() > eps:
+            hi = hi / hi.sum() + eps
         else:
-            h = torch.ones_like(h).to(h)
-        albedo_entropy += torch.sum(-h*torch.log(h))
+            hi = torch.ones_like(hi)
+        entropy += torch.sum(-hi * torch.log(hi))
+    return entropy
 
-    return albedo_entropy
-
-def get_tv_loss(
-    gt_image: torch.Tensor,  # [3, H, W]
-    prediction: torch.Tensor,  # [C, H, W]
-    pad: int = 1,
-    step: int = 1,
-) -> torch.Tensor:
-    if pad > 1:
-        gt_image = F.avg_pool2d(gt_image, pad, pad)
-        prediction = F.avg_pool2d(prediction, pad, pad)
-    rgb_grad_h = torch.exp(
-        -(gt_image[:, 1:, :] - gt_image[:, :-1, :]).abs().mean(dim=0, keepdim=True)
-    )  # [1, H-1, W]
-    rgb_grad_w = torch.exp(
-        -(gt_image[:, :, 1:] - gt_image[:, :, :-1]).abs().mean(dim=0, keepdim=True)
-    )  # [1, H-1, W]
+def get_tv_loss(prediction: torch.Tensor ) -> torch.Tensor:# [C, H, W]
     tv_h = torch.pow(prediction[:, 1:, :] - prediction[:, :-1, :], 2)  # [C, H-1, W]
     tv_w = torch.pow(prediction[:, :, 1:] - prediction[:, :, :-1], 2)  # [C, H, W-1]
-    tv_loss = (tv_h * rgb_grad_h).mean() + (tv_w * rgb_grad_w).mean()
-
-    if step > 1:
-        for s in range(2, step + 1):
-            rgb_grad_h = torch.exp(
-                -(gt_image[:, s:, :] - gt_image[:, :-s, :]).abs().mean(dim=0, keepdim=True)
-            )  # [1, H-1, W]
-            rgb_grad_w = torch.exp(
-                -(gt_image[:, :, s:] - gt_image[:, :, :-s]).abs().mean(dim=0, keepdim=True)
-            )  # [1, H-1, W]
-            tv_h = torch.pow(prediction[:, s:, :] - prediction[:, :-s, :], 2)  # [C, H-1, W]
-            tv_w = torch.pow(prediction[:, :, s:] - prediction[:, :, :-s], 2)  # [C, H, W-1]
-            tv_loss += (tv_h * rgb_grad_h).mean() + (tv_w * rgb_grad_w).mean()
+    tv_loss = tv_h.mean() + tv_w .mean()
 
     return tv_loss
 
 
 def get_masked_tv_loss(
     mask: torch.Tensor,  # [1, H, W]
-    gt_image: torch.Tensor,  # [3, H, W]
     prediction: torch.Tensor,  # [C, H, W]
-    erosion: bool = False,
 ) -> torch.Tensor:
-    rgb_grad_h = torch.exp(
-        -(gt_image[:, 1:, :] - gt_image[:, :-1, :]).abs().mean(dim=0, keepdim=True)
-    )  # [1, H-1, W]
-    rgb_grad_w = torch.exp(
-        -(gt_image[:, :, 1:] - gt_image[:, :, :-1]).abs().mean(dim=0, keepdim=True)
-    )  # [1, H-1, W]
     tv_h = torch.pow(prediction[:, 1:, :] - prediction[:, :-1, :], 2)  # [C, H-1, W]
     tv_w = torch.pow(prediction[:, :, 1:] - prediction[:, :, :-1], 2)  # [C, H, W-1]
 
     # erode mask
     mask = mask.float()
-    if erosion:
-        kernel = mask.new_ones([7, 7])
-        mask = kornia.morphology.erosion(mask[None, ...], kernel)[0]
     mask_h = mask[:, 1:, :] * mask[:, :-1, :]  # [1, H-1, W]
     mask_w = mask[:, :, 1:] * mask[:, :, :-1]  # [1, H, W-1]
 
-    tv_loss = (tv_h * rgb_grad_h * mask_h).mean() + (tv_w * rgb_grad_w * mask_w).mean()
+    tv_loss = (tv_h * mask_h).mean() + (tv_w * mask_w).mean()
 
     return tv_loss
 
@@ -167,10 +124,11 @@ def resize_tensorboard_img(
     transform = T.Resize(size=target_size)
     img = transform(img)  # [C, H', W']
     return img
+
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from):
     # torch.autograd.set_detect_anomaly(True)
     first_iter = 0
-    pbr_iteration = 5000
+    pbr_iteration = 30000
     tb_writer = prepare_output_and_logger(dataset)
     gaussians = GaussianModel(dataset.sh_degree, dataset.smpl_type, dataset.motion_offset_flag, dataset.actor_gender)
     scene = Scene(dataset, gaussians)
@@ -189,7 +147,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     # NOTE: prepare for PBR
     brdf_lut = get_brdf_lut().cuda()
     envmap_dirs = get_envmap_dirs()
-    cubemap = CubemapLight(base_res=32, train=True).cuda()
+    cubemap = CubemapLight(base_res=32).cuda()
     cubemap.train()
 
     aabb = torch.tensor([-bound, -bound, -bound, bound, bound, bound]).cuda()
@@ -216,6 +174,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     # lpips_test_lst = []
 
     elapsed_time = 0
+    knn_3 = None
+
     for iteration in range(first_iter, opt.iterations + 1):        
         if network_gui.conn == None:
             network_gui.try_connect()
@@ -234,8 +194,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         with torch.no_grad():
             env_map = cubemap.export_envmap(return_img=True, res = [16, 32]).permute(2, 0, 1).clamp(min=0.0, max=1.0)
-            # grayscale_transforms = Grayscale(num_output_channels=1)
-            # env_map = grayscale_transforms(env_map)
+            grayscale_transforms = Grayscale(num_output_channels=1)
+            env_map = grayscale_transforms(env_map)
 
         iter_start.record()
 
@@ -264,10 +224,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         render_pkg = render(iteration, viewpoint_cam, gaussians, pipe, background, envmap=env_map)
         image, alpha, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["render_alpha"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
         normal = render_pkg["normal"]
+        axis = render_pkg["render_axis"]
         world_normal = render_pkg["world_normal"]
         albedo = render_pkg["albedo"]
         roughness = render_pkg["roughness"][0, ...].unsqueeze(0)
-        metallic = render_pkg["metallic"][0, ...].unsqueeze(0)
         occlusion = render_pkg["occlusion"][0, ...].unsqueeze(0)
         # formulate roughness
         rmax, rmin = 1.0, 0.04
@@ -285,43 +245,52 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         # Loss
         gt_image = viewpoint_cam.original_image.cuda()
         gt_normal = viewpoint_cam.original_normal.cuda()
+        if 'zju' in dataset.source_path:
+            gt_normal = (gt_normal * 2) - 1.
+            gt_normal[2, ...] = -gt_normal[2, ...]
+            gt_normal = (gt_normal + 1) / 2.
         bkgd_mask = viewpoint_cam.bkgd_mask.cuda()
         bound_mask = viewpoint_cam.bound_mask.cuda()
         loss: torch.Tensor
         
         if iteration <= pbr_iteration:
             
-            scaling = gaussians.get_scaling
-            scale_loss = torch.sum(torch.max(scaling - 0.015, torch.zeros_like(scaling)))
-
-            point_posed = render_pkg['means3D']
-            distance, _ = gaussians.knn_near_2(point_posed[None], point_posed[None])
-            point_std = torch.std(distance[..., 1])
+            scaling = gaussians.get_scaling.mean()
+            
 
             Ll1 = l1_loss(image.permute(1,2,0)[bound_mask[0]==1], gt_image.permute(1,2,0)[bound_mask[0]==1])
             mask_loss = l2_loss(alpha[bound_mask==1], (bkgd_mask[0].unsqueeze(0))[bound_mask==1])
         
             normal_loss = l1_loss(normal.permute(1,2,0)[bound_mask[0]==1], gt_normal.permute(1,2,0)[bound_mask[0]==1])
+            axis_loss = l1_loss(axis.permute(1,2,0)[bound_mask[0]==1], gt_normal.permute(1,2,0)[bound_mask[0]==1])
+            # normal_loss = predicted_normal_loss(normal, gt_normal, bkgd_mask)
 
             # crop the object region
             x, y, w, h = cv2.boundingRect(bound_mask[0].cpu().numpy().astype(np.uint8))
             img_pred = image[:, y:y + h, x:x + w].unsqueeze(0)
             img_gt = gt_image[:, y:y + h, x:x + w].unsqueeze(0)
             normal_pred = normal[:, y:y + h, x:x + w].unsqueeze(0)
-            normal_gt = gt_normal[:, y:y + h, x:x + w].unsqueeze(0)
             # ssim loss
             ssim_loss = ssim(img_pred, img_gt)
-            ssim_loss += ssim(normal_pred, normal_gt)
             # lipis loss
             lpips_loss = loss_fn_vgg(img_pred, img_gt).reshape(-1)
+
+            
+            normal_gt = gt_normal[:, y:y + h, x:x + w].unsqueeze(0)
+            ssim_loss += ssim(normal_pred, normal_gt)
             lpips_loss += loss_fn_vgg(normal_pred, normal_gt).reshape(-1)
 
+            
 
-            loss = Ll1 + 0.1 * mask_loss + 0.01 * normal_loss + 0.01 * lpips_loss + 0.01 * (1.0 - ssim_loss) + 0.00 * scale_loss #+ point_std
+            normal_tv_loss = get_masked_tv_loss(alpha, normal)
+
+            loss = 1 * Ll1 + 0.1 * mask_loss + normal_loss + 1 * axis_loss + 0.01 * lpips_loss + 0.01 * (1.0 - ssim_loss) + 0.01 * normal_tv_loss + scaling
             if tb_writer:
                 tb_writer.add_scalar('train_loss_patches/normal_loss', normal_loss.item(), iteration)
-                tb_writer.add_scalar('train_loss_patches/scale_loss', scale_loss.item(), iteration)
-                tb_writer.add_scalar('train_loss_patches/point_std_loss', point_std.item(), iteration)
+                tb_writer.add_scalar('train_loss_patches/scale_loss', scaling.item(), iteration)
+
+            if iteration == pbr_iteration:
+                knn_3 = gaussians.get_knn_3[0]
         else: # NOTE: PBR
             
             cubemap.build_mips() # build mip for environment light
@@ -334,7 +303,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 mask=alpha.permute(1, 2, 0),  # [H, W, 1]
                 albedo=albedo.permute(1, 2, 0),  # [H, W, 3]
                 roughness=roughness.permute(1, 2, 0),  # [H, W, 1]
-                metallic=metallic.permute(1, 2, 0) if (metallic is not None) else None,  # [H, W, 1]
+                metallic=None,  # [H, W, 1]
                 tone=False,
                 gamma=False,
                 occlusion=occlusion.permute(1, 2, 0),
@@ -354,24 +323,27 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             loss = Ll1 + 0.01 * (1.0 - ssim_loss) + 0.01 * lpips_loss
 
             ### BRDF loss
-            if (alpha == 0).sum() > 0:
-                brdf_tv_loss = get_masked_tv_loss(
-                    alpha,
-                    gt_image,  # [3, H, W]
-                    torch.cat([albedo, roughness, metallic], dim=0),  # [5, H, W]
-                )
-            else:
-                brdf_tv_loss = get_tv_loss(
-                    gt_image,  # [3, H, W]
-                    torch.cat([albedo, roughness, metallic], dim=0),  # [5, H, W]
-                    pad=1,  # FIXME: 8 for scene
-                    step=1,
-                )
-            entropy_loss = get_entropy_loss(albedo)
-            # entropy_loss = get_entropy_loss(gaussians.get_albedo)
-            loss += brdf_tv_loss * 1.0 + 0.0000 * entropy_loss
-            lamb_loss = (1.0 - roughness[alpha > 0]).mean() + metallic[alpha > 0].mean() 
-            loss += lamb_loss * 0.001
+            brdf_tv_loss = get_masked_tv_loss(
+                alpha,
+                torch.cat([albedo, roughness], dim=0),  # [4, H, W]
+            )
+            
+            # entropy_loss = get_entropy_loss(albedo)gaussian_entropy
+            # entropy_loss = get_entropy_loss(gaussians.get_albedo) + get_entropy_loss(albedo)
+            entropy_loss =  gaussian_entropy(albedo) + gaussian_entropy(roughness)
+
+            lamb_weight = 0.001
+            env_tv_weight = 0.01
+            kl_weight = 0.1
+
+            loss += brdf_tv_loss * 1.0 + 5.0e-5 * entropy_loss
+            # loss += render_pkg['smooth_loss'] * 1.0 + kl_weight *  render_pkg["kl_loss"] + 5.0e-5 * entropy_loss
+            loss += 0.1 * (get_albedo_smooth_loss(gaussians.get_albedo[knn_3][:,1], gaussians.get_albedo[knn_3][:,2]) + get_roughness_smooth_loss(gaussians.get_roughness[knn_3][:,1], gaussians.get_roughness[knn_3][:,2]))
+
+
+            lamb_loss = (1.0 - roughness[alpha > 0]).mean() #+ metallic[alpha > 0].mean() 
+
+            loss += lamb_loss * lamb_weight
 
             if tb_writer:
                 tb_writer.add_scalar('train_loss_patches/entropy_loss', entropy_loss.item(), iteration)
@@ -388,11 +360,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             tv_h1 = torch.pow(envmap[1:, :, :] - envmap[:-1, :, :], 2).mean()
             tv_w1 = torch.pow(envmap[:, 1:, :] - envmap[:, :-1, :], 2).mean()
             env_tv_loss = tv_h1 + tv_w1
-            env_tv_weight = 0.01
             loss += env_tv_loss * env_tv_weight
 
         loss.backward()
-
+        # torch.nn.utils.clip_grad_norm(gaussians.get_opacity, 1, norm_type=2)
         # end time
         end_time = time.time()
         # Calculate elapsed time
@@ -445,6 +416,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             if iteration < opt.iterations:
                 gaussians.optimizer.step()
                 gaussians.optimizer.zero_grad(set_to_none = True)
+
                 if iteration >= pbr_iteration:
                     light_optimizer.step()
                     light_optimizer.zero_grad(set_to_none=True)
@@ -512,7 +484,7 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
                     render_output = renderFunc(iteration, viewpoint, scene.gaussians, *renderArgs, return_smpl_rot=True, envmap=light_map)
                     image = torch.clamp(render_output["render"], 0.0, 1.0)
                     normal = torch.clamp(render_output["normal"], 0.0, 1.0)
-                    if iteration> 5000:
+                    if iteration> 30000:
                         pbr_result = pbr_shading(
                             light=cubemap,
                             normals=render_output["world_normal"].permute(1, 2, 0).detach(),  # [H, W, 3]
@@ -520,7 +492,7 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
                             mask=render_output["render_alpha"].permute(1, 2, 0),  # [H, W, 1]
                             albedo=render_output["albedo"].permute(1, 2, 0),  # [H, W, 3]
                             roughness=render_output["roughness"].permute(1, 2, 0)[..., 0].unsqueeze(-1),  # [H, W, 1]
-                            metallic=render_output["metallic"].permute(1, 2, 0)[..., 0].unsqueeze(-1),  # [H, W, 1]
+                            metallic=None,
                             tone=False,
                             gamma=False,
                             occlusion=render_output["occlusion"].permute(1, 2, 0)[..., 0].unsqueeze(-1),
@@ -542,8 +514,9 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
                         tb_writer.add_images("albedo/" + config['name'] + "_view_{}".format(viewpoint.image_name), render_output["albedo"][None], global_step=iteration)
                         tb_writer.add_images("occlusion/" + config['name'] + "_view_{}".format(viewpoint.image_name), render_output["occlusion"][None], global_step=iteration)
                         tb_writer.add_images("roughness/" + config['name'] + "_view_{}".format(viewpoint.image_name), render_output["roughness"][None], global_step=iteration)
-                        tb_writer.add_images("metallic/" + config['name'] + "_view_{}".format(viewpoint.image_name), render_output["metallic"][None], global_step=iteration)
-                        if iteration > 5000:
+                        tb_writer.add_images("axis/" + config['name'] + "_view_{}".format(viewpoint.image_name), render_output["render_axis"][None], global_step=iteration)
+                        
+                        if iteration > 30000:
                             tb_writer.add_images("diffuse/" + config['name'] + "_view_{}".format(viewpoint.image_name), render_diffuse[None], global_step=iteration)
                             tb_writer.add_images("specular/" + config['name'] + "_view_{}".format(viewpoint.image_name), render_specular[None], global_step=iteration)
                         if idx < 1:
@@ -555,7 +528,7 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
                     psnr_test += psnr(image, gt_image).mean().double()
                     ssim_test += ssim(image, gt_image).mean().double()
                     lpips_test += loss_fn_vgg(image, gt_image).mean().double()
-                
+                    
                     smpl_rot[config['name']][viewpoint.pose_id]['transforms'] = render_output['transforms']
                     smpl_rot[config['name']][viewpoint.pose_id]['translation'] = render_output['translation']
 
@@ -569,6 +542,8 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
                     tb_writer.add_scalar(config['name'] + '/loss_viewpoint - psnr', psnr_test, iteration)
                     tb_writer.add_scalar(config['name'] + '/loss_viewpoint - ssim', ssim_test, iteration)
                     tb_writer.add_scalar(config['name'] + '/loss_viewpoint - lpips', lpips_test, iteration)
+                
+                torch.cuda.empty_cache()
 
         # Store data (serialize)
         save_path = os.path.join(scene.model_path, 'smpl_rot', f'iteration_{iteration}')
@@ -591,8 +566,8 @@ if __name__ == "__main__":
     parser.add_argument('--port', type=int, default=6009)
     parser.add_argument('--debug_from', type=int, default=-1)
     parser.add_argument('--detect_anomaly', action='store_true', default=False)
-    parser.add_argument("--test_iterations", nargs="+", type=int, default=[3_000, 5_000, 7_000, 10_000, 15_000, 20_000, 25_000, 30_000])
-    parser.add_argument("--save_iterations", nargs="+", type=int, default= [3_000, 5_000, 7_000, 10_000, 15_000, 20_000, 25_000, 30_000])
+    parser.add_argument("--test_iterations", nargs="+", type=int, default=[0, 3_000, 5_000, 7_000, 10_000, 15_000, 20_000, 25_000, 30_000, 50000])
+    parser.add_argument("--save_iterations", nargs="+", type=int, default= [0, 3_000, 5_000, 7_000, 10_000, 15_000, 20_000, 25_000, 30_000, 50000])
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
     parser.add_argument("--start_checkpoint", type=str, default = None)

@@ -116,6 +116,10 @@ def pbr_shading(
     brdf_lut: Optional[torch.Tensor] = None,
     background: Optional[torch.Tensor] = None,
 ) -> Dict:
+    # diffuse = light.specular[1] / (light.specular[1] + 0.18)
+    diffuse = light.diffuse.pow(1./2.2).clamp(min=0., max=1.)
+    # diffuse = light.diffuse.pow(1./2.2)
+    
     H, W, _ = normals.shape
     if background is None:
         background = torch.zeros_like(normals)  # [H, W, 3]
@@ -137,7 +141,8 @@ def pbr_shading(
 
     # Diffuse lookup
     diffuse_light = dr.texture(
-        light.diffuse[None, ...],  # [1, 6, 16, 16, 3]
+        # light.diffuse[None, ...],  # [1, 6, 16, 16, 3]
+        diffuse[None, ...],  # [1, 6, 16, 16, 3]
         normals.contiguous(),  # [1, H, W, 3]
         filter_mode="linear",
         boundary_mode="cube",
@@ -163,8 +168,10 @@ def pbr_shading(
     miplevel = light.get_mip(roughness)  # [1, H, W, 1]
     spec = dr.texture(
         light.specular[0][None, ...],  # [1, 6, env_res, env_res, 3]
+        # specular[0][None, ...],  # [1, 6, env_res, env_res, 3]
         ref_dirs.contiguous(),  # [1, H, W, 3]
         mip=list(m[None, ...] for m in light.specular[1:]),
+        # mip=list(m[None, ...] for m in specular[1:]),
         mip_level_bias=miplevel[..., 0],  # [1, H, W]
         filter_mode="linear-mipmap-linear",
         boundary_mode="cube",

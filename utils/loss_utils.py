@@ -89,23 +89,37 @@ def predicted_normal_loss(normal, normal_ref, alpha=None):
 
     return loss
 
-def delta_normal_loss(delta_normal_norm, alpha=None):
-    # delta_normal_norm: (3, H, W), alpha: (3, H, W)
-    if alpha is not None:
-        device = alpha.device
-        weight = alpha.detach().cpu().numpy()[0]
-        weight = (weight*255).astype(np.uint8)
+def kl_divergence(rho, rho_hat):
+    rho_hat = torch.mean(torch.sigmoid(rho_hat), 0)
+    rho = torch.tensor([rho] * len(rho_hat)).cuda()
+    return torch.mean(rho * torch.log(rho/rho_hat) + (1 - rho) * torch.log((1 - rho)/(1 - rho_hat)))
 
-        weight = erode(weight, erode_size=4)
+def get_kl_loss(latent_values):
+    latent_values = latent_values.view(-1, 32)
+    loss = kl_divergence(0.05, latent_values)
+    return loss
 
-        weight = torch.from_numpy(weight.astype(np.float32)/255.)
-        weight = weight[None,...].repeat(3,1,1)
-        weight = weight.to(device) 
-    else:
-        weight = torch.ones_like(delta_normal_norm)
+def get_albedo_smooth_loss(albedo_values, albedo_nn_values):
+    pt_num = albedo_values.shape[-2]
+    nn_num = albedo_nn_values.shape[-2] // pt_num
+    albedo_values = albedo_values.view(-1, pt_num, 1, 3)
+    albedo_nn_values = albedo_nn_values.view(-1, pt_num, nn_num, 3)
+    albedo_diff = albedo_values - albedo_nn_values
 
-    w = weight.permute(1,2,0).reshape(-1,3)[...,0].detach()
-    l = delta_normal_norm.permute(1,2,0).reshape(-1,3)[...,0]
-    loss = (w * l).mean()
+    scale = torch.mean(albedo_nn_values, dim=-2, keepdim=True) + 1e-6
+    loss = torch.mean(torch.abs(albedo_diff) / scale)
+
+    return loss
+
+def get_roughness_smooth_loss(roughness_values, roughness_nn_values):
+    pt_num = roughness_values.shape[-2]
+    nn_num = roughness_nn_values.shape[-2] // pt_num
+    ch_num = roughness_values.shape[-1]
+    roughness_values = roughness_values.view(-1, pt_num, 1, ch_num)
+    roughness_nn_values = roughness_nn_values.view(-1, pt_num, nn_num, ch_num)
+    diff = roughness_values - roughness_nn_values
+
+    scale = torch.sum(roughness_nn_values, dim=-2, keepdim=True) + 1e-6
+    loss = torch.mean(torch.abs(diff) / scale)
 
     return loss
